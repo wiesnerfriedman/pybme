@@ -268,9 +268,12 @@ mu, var = spde_kriging(mesh, Q, obs_idx, z_obs, nugget=0.01)
 |---|---|---|
 | **Hard + soft data, ns ≤ 5** | `bme_predict()` with default `method="auto"` | GH quadrature is exact and fast for few soft points |
 | **Hard + soft data, ns ≥ 6** | `bme_predict(..., method="laplace")` | Laplace scales as O(ns³) vs exponential for GH |
+| **Non-log-concave soft PDFs** | `bme_predict(..., method="ep")` | EP handles uniforms, intervals, and bimodal soft PDFs better than Laplace |
+| **Moderate ns (3-20), balanced cost/accuracy** | `bme_predict(..., method="qmc")` | Sobol QMC gives O(1/N) convergence vs O(1/√N) for MC |
+| **Unbiased estimate with Laplace speed** | `bme_predict(..., method="lis")` | Laplace Importance Sampling: unbiased correction to Laplace |
 | **Hard data only, any covariance** | `bme_predict()` with no `cs`/`soft_pdfs` | Falls back to standard kriging internally |
 | **Hard data only, Matérn, large 2-D field** | `spde_kriging()` | Sparse Cholesky is O(n^{3/2}) vs O(n³) dense |
-| **Very high ns or diagnostics** | `bme_predict(..., method="mc")` | Monte Carlo — unbiased but higher variance |
+| **Very high ns or diagnostics** | `bme_predict(..., method="mc")` | Monte Carlo — unbiased but highest variance |
 | **Space-time with soft data** | `bme_predict_st()` | Separable S/T kernel; supports all `method` options |
 
 **In short:**
@@ -312,8 +315,8 @@ cd pybme
 pytest
 ```
 
-Expected output: ~76 tests across 7 test files matching the MATLAB BMElib test suite structure
-plus SPDE and Laplace integration tests.
+Expected output: ~100+ tests across 8 test files matching the MATLAB BMElib test suite structure
+plus SPDE, Laplace, EP, QMC, and LIS integration tests.
 
 ---
 
@@ -327,11 +330,14 @@ $$
 f(z_k | \text{data}) \propto \underbrace{p(z_k | z_{\text{hard}})}_{\text{kriging prior}} \times \underbrace{\int \prod_i f_{S_i}(s_i) \, p(s_1, \dots, s_{n_s} | z_k, z_{\text{hard}}) \, ds}_{\text{soft-data likelihood}}
 $$
 
-The integral is evaluated numerically using one of three strategies:
+The integral is evaluated numerically using one of six strategies:
 
 1. **Gauss-Hermite tensor-product quadrature** (default for ns ≤ 5) — exact up to polynomial degree, preserves the full non-Gaussian shape of the posterior.
 2. **Laplace approximation** (default for ns ≥ 6, v0.3.0) — finds the posterior mode and uses a second-order Taylor expansion of the log-posterior, giving O(ns³) per point instead of exponential cost.  Based on the INLA methodology of Rue et al. (2009).
-3. **Monte Carlo sampling** — fallback for very high dimensions or when requested explicitly.
+3. **Expectation Propagation (EP)** (v0.4.0) — iteratively approximates each soft factor with a Gaussian site via moment matching.  O(ns² × iters) per point.  More accurate than Laplace for non-log-concave soft PDFs (uniforms, intervals, bimodal mixtures).  Based on Minka (2001).
+4. **Quasi-Monte Carlo (QMC)** (v0.4.0) — Sobol low-discrepancy sequences mapped through the inverse-normal CDF.  O(1/N) convergence vs O(1/√N) for plain MC.  Drop-in upgrade to MC when ns > 8.
+5. **Laplace Importance Sampling (LIS)** (v0.4.0) — uses the Laplace mode and Hessian as a Gaussian proposal for importance sampling.  Unbiased (unlike Laplace alone) with greatly reduced variance compared to plain MC.
+6. **Monte Carlo sampling** — fallback for very high dimensions or when requested explicitly.
 
 Unlike moment-matching approaches, all three methods can capture the non-Gaussian shape of the posterior when soft data is non-Gaussian.
 
@@ -343,9 +349,12 @@ Unlike moment-matching approaches, all three methods can capture the non-Gaussia
 |---|---|---|
 | Language | MATLAB + Fortran MEX | Pure Python (NumPy/SciPy) |
 | Soft-data types | 4 softpdftype codes | 10+ named constructors |
-| Integration engine | Fortran mvPro / mvProAG2 | GH quadrature + Laplace + MC |
+| Integration engine | Fortran mvPro / mvProAG2 | GH + Laplace + EP + QMC + LIS + MC |
 | SPDE / GMRF kriging | — | `spde_kriging()` on FEM mesh (hard data only) |
 | Laplace approximation | — | `method="laplace"` in `bme_predict` (full BME) |
+| Expectation Propagation | — | `method="ep"` in `bme_predict` (v0.4.0) |
+| Quasi-Monte Carlo | — | `method="qmc"` in `bme_predict` (v0.4.0) |
+| Laplace Importance Sampling | — | `method="lis"` in `bme_predict` (v0.4.0) |
 | Space-time | Full S/T framework | Separable S/T |
 | Covariance fitting | Manual | REML auto-fit |
 | Cross-validation | Manual scripting | Built-in `cross_validate()` |

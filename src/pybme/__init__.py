@@ -77,6 +77,9 @@ from .trend import design_matrix, estimate_trend
 from .integration import (
     integrate_soft_product, integrate_soft_product_batch,
     integrate_soft_laplace, integrate_soft_laplace_batch,
+    integrate_soft_ep, integrate_soft_ep_batch,
+    integrate_soft_qmc, integrate_soft_qmc_batch,
+    integrate_soft_lis, integrate_soft_lis_batch,
 )
 
 # SPDE / GMRF (INLA-inspired scalability)
@@ -95,7 +98,7 @@ from .validation import cross_validate
 # The original monolithic script is available as pybme.bme_core
 # Tutorials are available as pybme.tutorials.*
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __author__  = "Corinne Wiesner-Friedman"
 __credits__ = [
     "Corinne Wiesner-Friedman",
@@ -118,6 +121,9 @@ __all__ = [
     "design_matrix", "estimate_trend",
     "integrate_soft_product", "integrate_soft_product_batch",
     "integrate_soft_laplace", "integrate_soft_laplace_batch",
+    "integrate_soft_ep", "integrate_soft_ep_batch",
+    "integrate_soft_qmc", "integrate_soft_qmc_batch",
+    "integrate_soft_lis", "integrate_soft_lis_batch",
     # SPDE / GMRF
     "SPDEMesh", "matern_to_spde_params", "build_precision_matrix",
     "spde_kriging", "snap_to_mesh",

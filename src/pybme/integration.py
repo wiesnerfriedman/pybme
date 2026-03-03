@@ -8,13 +8,29 @@ Methods:
   * Monte Carlo fallback  (> 8 dimensions)
   * **Laplace approximation** — O(ns³) per evaluation, accurate
     for near-Gaussian soft PDFs, replaces exponential-cost GH for ns ≥ 6.
-    Original contribution by Corinne Wiesner-Friedman (not part of
-    MATLAB BMElib), inspired by the INLA methodology of Rue et al. (2009).
+  * **Expectation Propagation (EP)** — O(ns² · iters) per evaluation,
+    iteratively approximates each soft factor with a Gaussian site.
+    More accurate than Laplace for non-log-concave PDFs (uniforms,
+    intervals, bimodal).
+  * **Quasi-Monte Carlo (QMC)** — O(n_samples × ns) with O(1/N)
+    convergence via Sobol sequences instead of O(1/√N) for plain MC.
+  * **Laplace Importance Sampling (LIS)** — uses the Laplace mode and
+    Hessian as a Gaussian proposal for importance sampling, giving
+    unbiased results with much lower variance than raw MC.
+
+Original contributions by Corinne Wiesner-Friedman (not part of MATLAB
+BMElib), inspired by:
 
     Rue H., Martino S. & Chopin N. (2009).  Approximate Bayesian inference
     for latent Gaussian models by using integrated nested Laplace
     approximations.  JRSS-B, 71(2), 319–392.
     https://doi.org/10.1111/j.1467-9868.2008.00700.x
+
+    Minka T. (2001).  Expectation Propagation for approximate Bayesian
+    inference.  UAI 2001, 362–369.
+
+    Rasmussen C.E. & Williams C.K.I. (2006).  Gaussian Processes for
+    Machine Learning.  MIT Press, Ch. 3.
 """
 
 from __future__ import annotations
@@ -484,3 +500,479 @@ def integrate_soft_laplace_batch(soft_pdfs: List[SoftPDF],
             result[j] = 1e-300
 
     return result
+
+
+# ════════════════════════════════════════════════════════════════
+# QUASI-MONTE CARLO  (QMC — Sobol sequences)
+# ════════════════════════════════════════════════════════════════
+#
+# Same idea as plain MC, but uses low-discrepancy Sobol points
+# instead of pseudo-random draws.  Convergence: O(1/N) instead of
+# O(1/√N).  Useful when ns is moderate (3-20) and GH is too
+# expensive.
+#
+# References:
+#   Joe S. & Kuo F.Y. (2008).  Constructing Sobol sequences with
+#   better two-dimensional projections.
+#   Scipy: scipy.stats.qmc.Sobol
+
+def integrate_soft_qmc(soft_pdfs: List[SoftPDF],
+                       mu: np.ndarray, cov: np.ndarray,
+                       n_samples: int = 4096) -> float:
+    """Quasi-Monte Carlo integration for  E_{x ~ N(μ, Σ)}[ ∏ fᵢ(xᵢ) ].
+
+    Uses a scrambled Sobol sequence mapped through the inverse-normal
+    CDF so that points are distributed as N(μ, Σ).
+
+    Parameters
+    ----------
+    soft_pdfs : list of SoftPDF  (length ns)
+    mu        : (ns,) conditional mean
+    cov       : (ns, ns) conditional covariance
+    n_samples : number of Sobol points (rounded up to next power of 2)
+
+    Returns
+    -------
+    float ≥ 1e-300
+    """
+    from scipy.stats import qmc, norm as sp_norm
+
+    ns = len(soft_pdfs)
+    if ns == 0:
+        return 1.0
+
+    mu = np.asarray(mu, dtype=np.float64).ravel()
+    cov = np.asarray(cov, dtype=np.float64)
+    cov = 0.5 * (cov + cov.T) + np.eye(ns) * 1e-10
+
+    try:
+        L = np.linalg.cholesky(cov)
+    except np.linalg.LinAlgError:
+        ev, Q = np.linalg.eigh(cov)
+        L = Q @ np.diag(np.sqrt(np.maximum(ev, 1e-10)))
+
+    # Round n_samples up to next power of 2 (Sobol requirement)
+    m = max(int(np.ceil(np.log2(max(n_samples, 2)))), 1)
+    sampler = qmc.Sobol(d=ns, scramble=True)
+    u_unit = sampler.random_base2(m)   # (2^m, ns) in [0, 1)
+    u_norm = sp_norm.ppf(np.clip(u_unit, 1e-10, 1 - 1e-10))  # → N(0,1)
+    x = mu[None, :] + u_norm @ L.T    # (N, ns)
+
+    prod_f = np.ones(x.shape[0])
+    for i, sp in enumerate(soft_pdfs):
+        prod_f *= sp.evaluate(x[:, i])
+    return max(float(np.mean(prod_f)), 1e-300)
+
+
+def integrate_soft_qmc_batch(soft_pdfs: List[SoftPDF],
+                             mu_grid: np.ndarray,
+                             cov: np.ndarray,
+                             n_samples: int = 4096) -> np.ndarray:
+    """Batch QMC integration for multiple conditional means.
+
+    Parameters
+    ----------
+    soft_pdfs : list of SoftPDF  (length ns)
+    mu_grid   : (M, ns) array — one mean per row
+    cov       : (ns, ns) conditional covariance
+    n_samples : Sobol sample count (rounded up to power of 2)
+
+    Returns
+    -------
+    (M,) array of integral values (clamped ≥ 1e-300)
+    """
+    from scipy.stats import qmc, norm as sp_norm
+
+    ns = len(soft_pdfs)
+    M = mu_grid.shape[0]
+    if ns == 0:
+        return np.ones(M)
+
+    mu_grid = np.asarray(mu_grid, dtype=np.float64)
+    cov = np.asarray(cov, dtype=np.float64)
+    cov = 0.5 * (cov + cov.T) + np.eye(ns) * 1e-10
+
+    try:
+        L = np.linalg.cholesky(cov)
+    except np.linalg.LinAlgError:
+        ev, Qm = np.linalg.eigh(cov)
+        L = Qm @ np.diag(np.sqrt(np.maximum(ev, 1e-10)))
+
+    m = max(int(np.ceil(np.log2(max(n_samples, 2)))), 1)
+    sampler = qmc.Sobol(d=ns, scramble=True)
+    u_unit = sampler.random_base2(m)
+    u_norm = sp_norm.ppf(np.clip(u_unit, 1e-10, 1 - 1e-10))
+    uL = u_norm @ L.T   # (N, ns)
+    N = uL.shape[0]
+
+    result = np.empty(M)
+    chunk = max(1, min(M, int(50_000_000 / max(N * ns, 1))))
+    for start in range(0, M, chunk):
+        end = min(start + chunk, M)
+        Mc = end - start
+        x = mu_grid[start:end, None, :] + uL[None, :, :]  # (Mc, N, ns)
+        prod_f = np.ones((Mc, N))
+        for i, sp in enumerate(soft_pdfs):
+            prod_f *= sp.evaluate(x[:, :, i].ravel()).reshape(Mc, -1)
+        result[start:end] = np.mean(prod_f, axis=1)
+    return np.maximum(result, 1e-300)
+
+
+# ════════════════════════════════════════════════════════════════
+# EXPECTATION PROPAGATION  (EP)
+# ════════════════════════════════════════════════════════════════
+#
+# Approximate each non-Gaussian soft factor fᵢ(xᵢ) with a
+# *Gaussian site*  t̃_i(x_i) = s_i exp(τ_i x_i - ½ λ_i x_i²),
+# so that the full posterior is a product of Gaussians — exact in
+# closed form.  Sites are refined iteratively by moment matching.
+#
+# Cost: O(ns² × iters)  — no quadrature, no sampling.
+#
+# References:
+#   Minka T. (2001)  Expectation Propagation for approximate
+#     Bayesian inference.  UAI 2001.
+#   Rasmussen & Williams (2006), Ch. 3.6.
+
+# NumPy compat: use trapezoid if available (NumPy >= 2.0)
+_trapz_compat = getattr(np, "trapezoid", np.trapz)
+
+
+def _ep_1d_moments(sp: SoftPDF, cavity_mean: float,
+                   cavity_var: float) -> tuple:
+    """Compute zeroth, first, and second moments of  f(x) * N(x|m,v).
+
+    Uses the SoftPDF z_grid for numerical quadrature.
+
+    Returns (Z, mean, var) where Z = ∫ f(x) N(x|m,v) dx.
+    """
+    z = sp.z_grid
+    if len(z) < 2:
+        return 1.0, cavity_mean, cavity_var
+
+    fv = sp.evaluate(z)
+    # Gaussian cavity density at the grid points
+    if cavity_var <= 0:
+        cavity_var = 1e-10
+    sd = math.sqrt(cavity_var)
+    g = np.exp(-0.5 * ((z - cavity_mean) / sd) ** 2) / (sd * math.sqrt(2.0 * math.pi))
+    h = fv * g  # unnormalised integrand
+
+    # Trapezoidal integration
+    Z = float(_trapz_compat(h, z))
+    if Z <= 0:
+        return 1e-300, cavity_mean, cavity_var
+    m = float(_trapz_compat(z * h, z)) / Z
+    v = float(_trapz_compat((z - m) ** 2 * h, z)) / Z
+    v = max(v, 1e-12)
+    return Z, m, v
+
+
+def integrate_soft_ep(soft_pdfs: List[SoftPDF],
+                      mu: np.ndarray, cov: np.ndarray,
+                      max_iter: int = 50, damp: float = 0.8,
+                      tol: float = 1e-6) -> float:
+    """Expectation Propagation for  E_{x ~ N(μ, Σ)}[ ∏ fᵢ(xᵢ) ].
+
+    Iteratively approximates each soft factor with a Gaussian site
+    and returns the normalising constant of the resulting Gaussian
+    approximation multiplied by the accumulated site scales.
+
+    Parameters
+    ----------
+    soft_pdfs : list of SoftPDF  (length ns)
+    mu        : (ns,) prior conditional mean
+    cov       : (ns, ns) prior conditional covariance
+    max_iter  : EP sweeps
+    damp      : damping factor in (0, 1] — lower = more stable
+    tol       : convergence threshold on site parameter change
+
+    Returns
+    -------
+    float ≥ 1e-300
+    """
+    ns = len(soft_pdfs)
+    if ns == 0:
+        return 1.0
+
+    mu = np.asarray(mu, dtype=np.float64).ravel()
+    cov = np.asarray(cov, dtype=np.float64)
+    cov = 0.5 * (cov + cov.T) + np.eye(ns) * 1e-10
+
+    # Natural parameters of prior:  Λ = Σ⁻¹,  η = Λ μ
+    Lambda = np.linalg.inv(cov)
+    eta = Lambda @ mu
+
+    # Site natural parameters (initially zero → non-informative)
+    tau = np.zeros(ns)    # precision ≡ λ_i
+    nu = np.zeros(ns)     # precision-weighted mean ≡ τ_i × m_i
+
+    for _sweep in range(max_iter):
+        max_delta = 0.0
+        for i in range(ns):
+            # --- Cavity distribution for dimension i ---
+            Lambda_post = Lambda.copy()
+            Lambda_post[np.diag_indices(ns)] += tau
+            eta_post = eta + nu
+
+            try:
+                Sigma_post = np.linalg.inv(Lambda_post)
+            except np.linalg.LinAlgError:
+                continue
+            mu_post = Sigma_post @ eta_post
+
+            # Remove site i to get cavity
+            cavity_var = Sigma_post[i, i]
+            if cavity_var <= 0:
+                continue
+            tau_cav = 1.0 / cavity_var - tau[i]
+            nu_cav = mu_post[i] / cavity_var - nu[i]
+            if tau_cav <= 0:
+                tau_cav = 1e-8
+            cavity_mean = nu_cav / tau_cav
+            cav_var = 1.0 / tau_cav
+
+            # --- Moment matching ---
+            Z_i, m_hat, v_hat = _ep_1d_moments(
+                soft_pdfs[i], cavity_mean, cav_var)
+
+            if Z_i <= 0 or v_hat <= 0:
+                continue
+
+            # New site parameters (precision parameterisation)
+            tau_new = max(1.0 / v_hat - tau_cav, 1e-10)
+            nu_new = m_hat / v_hat - nu_cav
+
+            # Damped update
+            tau_upd = damp * tau_new + (1.0 - damp) * tau[i]
+            nu_upd = damp * nu_new + (1.0 - damp) * nu[i]
+
+            max_delta = max(max_delta,
+                            abs(tau_upd - tau[i]),
+                            abs(nu_upd - nu[i]))
+            tau[i] = tau_upd
+            nu[i] = nu_upd
+
+        if max_delta < tol:
+            break
+
+    # --- Compute the EP marginal-likelihood approximation ---
+    # Posterior precision / mean:
+    #   Λ_q = Λ + diag(τ),  η_q = η + ν,  Σ_q = Λ_q⁻¹,  μ_q = Σ_q η_q
+    Lambda_q = Lambda.copy()
+    Lambda_q[np.diag_indices(ns)] += tau
+    eta_q = eta + nu
+
+    try:
+        sign, logdet_q = np.linalg.slogdet(Lambda_q)
+        if sign <= 0:
+            return 1e-300
+        Sigma_q = np.linalg.inv(Lambda_q)
+        mu_q = Sigma_q @ eta_q
+    except np.linalg.LinAlgError:
+        return 1e-300
+
+    _, logdet_prior = np.linalg.slogdet(Lambda)
+
+    # Compute site log-scales from the *final* cavities.
+    # log ŝᵢ = log Zᵢ + ½ log(v_cav/v̂) + ½ m_cav²/v_cav − ½ m̂²/v̂
+    # where Zᵢ, m̂, v̂ come from moment matching against the final cavity.
+    log_s_sum = 0.0
+    for i in range(ns):
+        post_var_i = Sigma_q[i, i]
+        if post_var_i <= 0:
+            continue
+        tau_cav = 1.0 / post_var_i - tau[i]
+        nu_cav = mu_q[i] / post_var_i - nu[i]
+        if tau_cav <= 0:
+            tau_cav = 1e-8
+        cav_var = 1.0 / tau_cav
+        cav_mean = nu_cav / tau_cav
+
+        Z_i, m_hat, v_hat = _ep_1d_moments(
+            soft_pdfs[i], cav_mean, cav_var)
+        if Z_i <= 0 or v_hat <= 0:
+            continue
+
+        log_s_sum += (math.log(max(Z_i, 1e-300))
+                      + 0.5 * math.log(max(cav_var / v_hat, 1e-300))
+                      + 0.5 * cav_mean ** 2 / cav_var
+                      - 0.5 * m_hat ** 2 / v_hat)
+
+    # log Z_EP = Σ log ŝᵢ  +  ½ (log|Λ| − log|Λ_q|)
+    #          + ½ (η_q^T Σ_q η_q  −  η^T Σ η)
+    log_Z = log_s_sum
+    log_Z += 0.5 * (logdet_prior - logdet_q)
+    log_Z += 0.5 * (float(eta_q @ Sigma_q @ eta_q)
+                     - float(eta @ cov @ eta))
+
+    return max(math.exp(min(log_Z, 500.0)), 1e-300)
+
+
+def integrate_soft_ep_batch(soft_pdfs: List[SoftPDF],
+                            mu_grid: np.ndarray,
+                            cov: np.ndarray,
+                            max_iter: int = 50,
+                            damp: float = 0.8,
+                            tol: float = 1e-6) -> np.ndarray:
+    """Batch EP integration for multiple conditional means.
+
+    Parameters
+    ----------
+    soft_pdfs : list of SoftPDF  (length ns)
+    mu_grid   : (M, ns) array — one mean per row
+    cov       : (ns, ns) conditional covariance
+    max_iter  : EP sweeps per evaluation
+    damp      : damping factor
+    tol       : convergence tolerance
+
+    Returns
+    -------
+    (M,) array ≥ 1e-300
+    """
+    M = mu_grid.shape[0]
+    ns = len(soft_pdfs)
+    if ns == 0:
+        return np.ones(M)
+    result = np.empty(M)
+    for j in range(M):
+        result[j] = integrate_soft_ep(soft_pdfs, mu_grid[j], cov,
+                                      max_iter=max_iter, damp=damp,
+                                      tol=tol)
+    return np.maximum(result, 1e-300)
+
+
+# ════════════════════════════════════════════════════════════════
+# LAPLACE IMPORTANCE SAMPLING  (LIS)
+# ════════════════════════════════════════════════════════════════
+#
+# 1. Run the existing Laplace machinery to find the mode x* and
+#    Hessian H of log g(x) = log N(x|μ,Σ) + Σ log fᵢ(xᵢ).
+# 2. Build a Gaussian proposal  q(x) = N(x*; (−H)⁻¹).
+# 3. Draw N importance samples from q, compute weights
+#    w_j = g(x_j) / q(x_j),  and return  mean(w_j) × Z_prior.
+#
+# The estimate is *unbiased* (unlike Laplace alone) and has much
+# lower variance than raw MC because the proposal is centred on
+# the mode.
+#
+# Cost: O(ns³) for mode+Hessian  +  O(N × ns²) for sampling.
+
+def integrate_soft_lis(soft_pdfs: List[SoftPDF],
+                       mu: np.ndarray, cov: np.ndarray,
+                       n_samples: int = 4096) -> float:
+    """Laplace Importance Sampling for  E_{x ~ N(μ, Σ)}[ ∏ fᵢ(xᵢ) ].
+
+    Unbiased correction to Laplace: uses the Laplace mode & Hessian
+    as a Gaussian importance-sampling proposal.
+
+    Parameters
+    ----------
+    soft_pdfs : list of SoftPDF  (length ns)
+    mu        : (ns,) conditional mean
+    cov       : (ns, ns) conditional covariance
+    n_samples : importance samples to draw
+
+    Returns
+    -------
+    float ≥ 1e-300
+    """
+    ns = len(soft_pdfs)
+    if ns == 0:
+        return 1.0
+
+    mu = np.asarray(mu, dtype=np.float64).ravel()
+    cov = np.asarray(cov, dtype=np.float64)
+    cov = 0.5 * (cov + cov.T) + np.eye(ns) * 1e-10
+    Q = np.linalg.inv(cov)
+
+    # --- Laplace mode + Hessian ---
+    try:
+        x_star = _find_mode(soft_pdfs, mu, Q)
+        H = _log_target_hessian(x_star, soft_pdfs, mu, Q)
+        neg_H = -H
+        ev = np.linalg.eigvalsh(neg_H)
+        if ev.min() <= 0:
+            neg_H += (abs(ev.min()) + 1e-6) * np.eye(ns)
+        Sigma_prop = np.linalg.inv(neg_H)        # proposal covariance
+        Sigma_prop = 0.5 * (Sigma_prop + Sigma_prop.T)
+        L_prop = np.linalg.cholesky(Sigma_prop)
+    except Exception:
+        # Fall back to plain MC if Laplace mode-finding fails
+        try:
+            L_prior = np.linalg.cholesky(cov)
+        except np.linalg.LinAlgError:
+            ev2, Q2 = np.linalg.eigh(cov)
+            L_prior = Q2 @ np.diag(np.sqrt(np.maximum(ev2, 1e-10)))
+        u = np.random.randn(n_samples, ns)
+        x = mu[None, :] + u @ L_prior.T
+        prod_f = np.ones(n_samples)
+        for i, sp in enumerate(soft_pdfs):
+            prod_f *= sp.evaluate(x[:, i])
+        return max(float(np.mean(prod_f)), 1e-300)
+
+    # --- Importance sampling from proposal q = N(x*; Σ_prop) ---
+    u = np.random.randn(n_samples, ns)
+    x = x_star[None, :] + u @ L_prop.T    # (N, ns)
+
+    # log g(x_j) = log N(x_j | mu, cov) + Σ log fᵢ(x_ji)  [unnormalised]
+    # log q(x_j) = log N(x_j | x*, Σ_prop)
+    # But E[∏fᵢ] = (1/(2π)^{ns/2} |Σ|^{1/2})
+    #              × ∫ exp(-½(x-μ)^T Q (x-μ)) ∏fᵢ dx
+    # Weight = [N_prior(x) × ∏fᵢ(x)] / q(x)
+    # and we return mean(weights).
+
+    # Compute log-weights stably:
+    # log_w_j = log_target(x_j) - log_q(x_j)
+    # where log_target = -0.5 (x-mu)^T Q (x-mu) + sum log f_i
+    #       log_q      = -0.5 (x-x*)^T negH (x-x*)  + const_q
+    # The 1/(2π)^{ns/2} |Σ|^{1/2} from prior and analogous term
+    # from proposal cancel partially; easier to compute the ratio:
+
+    _, logdet_cov = np.linalg.slogdet(cov)
+    _, logdet_prop = np.linalg.slogdet(Sigma_prop)
+
+    log_w = np.empty(n_samples)
+    for j in range(n_samples):
+        xj = x[j]
+        lt = _log_target(xj, soft_pdfs, mu, Q)  # -0.5 d^T Q d + Σlog f
+        dq = xj - x_star
+        lq = -0.5 * float(dq @ neg_H @ dq)     # log q (up to const)
+        log_w[j] = lt - lq
+    # Normalising constant ratio: (|Σ_prop|/|Σ|)^{1/2}
+    log_w += 0.5 * (logdet_prop - logdet_cov)
+
+    # Stable mean of exp(log_w)
+    max_lw = np.max(log_w)
+    if not np.isfinite(max_lw):
+        return 1e-300
+    result = math.exp(min(max_lw, 500.0)) * float(np.mean(np.exp(log_w - max_lw)))
+    return max(result, 1e-300)
+
+
+def integrate_soft_lis_batch(soft_pdfs: List[SoftPDF],
+                             mu_grid: np.ndarray,
+                             cov: np.ndarray,
+                             n_samples: int = 4096) -> np.ndarray:
+    """Batch LIS integration for multiple conditional means.
+
+    Parameters
+    ----------
+    soft_pdfs : list of SoftPDF  (length ns)
+    mu_grid   : (M, ns) array — one mean per row
+    cov       : (ns, ns) conditional covariance
+    n_samples : importance samples per evaluation
+
+    Returns
+    -------
+    (M,) array ≥ 1e-300
+    """
+    M = mu_grid.shape[0]
+    ns = len(soft_pdfs)
+    if ns == 0:
+        return np.ones(M)
+    result = np.empty(M)
+    for j in range(M):
+        result[j] = integrate_soft_lis(soft_pdfs, mu_grid[j], cov,
+                                       n_samples=n_samples)
+    return np.maximum(result, 1e-300)

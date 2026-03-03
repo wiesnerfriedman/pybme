@@ -27,6 +27,9 @@ from .distance import coord2dist
 from .integration import (
     integrate_soft_product, integrate_soft_product_batch,
     integrate_soft_laplace, integrate_soft_laplace_batch,
+    integrate_soft_qmc, integrate_soft_qmc_batch,
+    integrate_soft_ep, integrate_soft_ep_batch,
+    integrate_soft_lis, integrate_soft_lis_batch,
 )
 from .neighborhood import (
     select_neighbors, select_neighbors_st,
@@ -94,7 +97,10 @@ def bme_predict(ck, ch, zh,
     n_jobs     : number of parallel workers (1 = serial; -1 = all CPUs).
                  Requires ``joblib`` when > 1.
     method     : integration method for soft data: ``'auto'`` (default),
-                 ``'gauss_hermite'``, ``'laplace'``, or ``'mc'``.
+                 ``'gauss_hermite'``, ``'laplace'``, ``'mc'``,
+                 ``'ep'`` (Expectation Propagation),
+                 ``'qmc'`` (Quasi-Monte Carlo), or
+                 ``'lis'`` (Laplace Importance Sampling).
                  ``'auto'`` selects Laplace when ns >= 6, GH otherwise.
 
     Returns
@@ -273,6 +279,12 @@ def _bme_point(ck, ch, zh, cs, soft_pdfs,
         _method = "laplace" if ns >= 6 else "gauss_hermite"
     if _method == "laplace":
         I_num = integrate_soft_laplace_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "ep":
+        I_num = integrate_soft_ep_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "qmc":
+        I_num = integrate_soft_qmc_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "lis":
+        I_num = integrate_soft_lis_batch(sp_dt, mu_all, K_s_kh)
     else:
         I_num = integrate_soft_product_batch(sp_dt, mu_all, K_s_kh, n_quad)
     pdf_raw = prior * I_num
@@ -331,7 +343,10 @@ def bme_predict_st(ck, tk, ch, th, zh,
         Requires ``joblib`` when > 1.
     method : str
         Integration method for soft data: ``'auto'`` (default),
-        ``'gauss_hermite'``, ``'laplace'``, or ``'mc'``.
+        ``'gauss_hermite'``, ``'laplace'``, ``'mc'``,
+        ``'ep'`` (Expectation Propagation),
+        ``'qmc'`` (Quasi-Monte Carlo), or
+        ``'lis'`` (Laplace Importance Sampling).
         ``'auto'`` selects Laplace when ns >= 6, GH otherwise.
     """
     ck = np.atleast_2d(ck)
@@ -487,6 +502,12 @@ def _bme_st_point(ck_i, tk_i, ch, th, zh, cs, ts, soft_pdfs,
         _method = "laplace" if ns >= 6 else "gauss_hermite"
     if _method == "laplace":
         I_num = integrate_soft_laplace_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "ep":
+        I_num = integrate_soft_ep_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "qmc":
+        I_num = integrate_soft_qmc_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "lis":
+        I_num = integrate_soft_lis_batch(sp_dt, mu_all, K_s_kh)
     else:
         I_num = integrate_soft_product_batch(sp_dt, mu_all, K_s_kh, n_quad)
     pdf_raw = prior * I_num
