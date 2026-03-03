@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pybme"
+version = "0.1.0"
+description = "Bayesian Maximum Entropy geostatistical library — a Python port of MATLAB BMElib (Serre & Christakos)."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Corinne Wiesner-Friedman"},
+]
+# PyBME is a Python port of the MATLAB BMElib library.
+# Original BMElib authors: Marc L. Serre and George Christakos (UNC Chapel Hill).
+# Reference: Serre M.L. & Christakos G. (1999). BMElib: modern geostatistics
+#            for environmental and health sciences. SERRA 13:1-14.
+keywords = ["geostatistics", "BME", "kriging", "soft-data", "spatial"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.6"]
+dev  = ["pytest>=7", "matplotlib>=3.6"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
