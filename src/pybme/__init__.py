@@ -18,6 +18,30 @@ please cite the original BMElib:
 
 BMElib homepage: http://www.unc.edu/depts/case/BMElib/
 
+INLA-SPDE extensions (v0.3.0)
+-----------------------------
+The SPDE/GMRF module (``spde.py``) and Laplace approximation for
+soft-data integration (in ``integration.py``) are original contributions
+by Corinne Wiesner-Friedman and are not part of the original MATLAB
+BMElib.  They are inspired by the INLA-SPDE methodology.
+
+* ``spde_kriging()`` provides **hard-data kriging only** via sparse
+  precision matrices (Matérn, 2-D, simple kriging).
+* The Laplace approximation (``method='laplace'`` in ``bme_predict``)
+  works within the **full BME pipeline** with soft probabilistic data.
+
+If you use these features please also cite:
+
+    Lindgren F., Rue H. & Lindström J. (2011).  An explicit link between
+    Gaussian fields and Gaussian Markov random fields: the stochastic
+    partial differential equation approach.  JRSS-B, 73(4), 423–498.
+    https://doi.org/10.1111/j.1467-9868.2011.00777.x
+
+    Rue H., Martino S. & Chopin N. (2009).  Approximate Bayesian
+    inference for latent Gaussian models by using integrated nested
+    Laplace approximations.  JRSS-B, 71(2), 319–392.
+    https://doi.org/10.1111/j.1467-9868.2008.00700.x
+
 Quick start::
 
     from pybme import bme_predict, SoftPDF, fit_covariance
@@ -45,9 +69,24 @@ from .covariance import (
 
 # prediction
 from .predict import bme_predict, bme_predict_st
-from .neighborhood import select_neighbors, select_neighbors_st
+from .neighborhood import (
+    select_neighbors, select_neighbors_st,
+    SpatialIndex, SpatialTemporalIndex,
+)
 from .trend import design_matrix, estimate_trend
-from .integration import integrate_soft_product
+from .integration import (
+    integrate_soft_product, integrate_soft_product_batch,
+    integrate_soft_laplace, integrate_soft_laplace_batch,
+)
+
+# SPDE / GMRF (INLA-inspired scalability)
+from .spde import (
+    SPDEMesh,
+    matern_to_spde_params,
+    build_precision_matrix,
+    spde_kriging,
+    snap_to_mesh,
+)
 
 # fitting & validation
 from .fitting import fit_covariance
@@ -56,7 +95,7 @@ from .validation import cross_validate
 # The original monolithic script is available as pybme.bme_core
 # Tutorials are available as pybme.tutorials.*
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 __author__  = "Corinne Wiesner-Friedman"
 __credits__ = [
     "Corinne Wiesner-Friedman",
@@ -75,8 +114,13 @@ __all__ = [
     "bme_predict", "bme_predict_st",
     # neighborhood / trend / integration
     "select_neighbors", "select_neighbors_st",
+    "SpatialIndex", "SpatialTemporalIndex",
     "design_matrix", "estimate_trend",
-    "integrate_soft_product",
+    "integrate_soft_product", "integrate_soft_product_batch",
+    "integrate_soft_laplace", "integrate_soft_laplace_batch",
+    # SPDE / GMRF
+    "SPDEMesh", "matern_to_spde_params", "build_precision_matrix",
+    "spde_kriging", "snap_to_mesh",
     # fitting / validation
     "fit_covariance", "cross_validate",
 ]

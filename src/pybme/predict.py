@@ -2,10 +2,19 @@
 
 This module corresponds to the MATLAB functions BMEprobaPdf, BMEprobaMode,
 BMEprobaMoments, BMEprobaCI combined into a single efficient call.
+
+Scalability features (v0.2)
+---------------------------
+* KD-tree neighbourhood via ``SpatialIndex`` / ``SpatialTemporalIndex``
+  — O(K log N) instead of O(K N).
+* Vectorised z-grid integration loop (whole grid evaluated by one
+  ``integrate_soft_product_batch`` call).
+* Optional ``joblib`` parallel backend (``n_jobs>1``).
 """
 
 from __future__ import annotations
 import math
+import warnings
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -15,8 +24,14 @@ from scipy.stats import norm
 
 from .covariance import build_cov_matrix, build_cov_matrix_st
 from .distance import coord2dist
-from .integration import integrate_soft_product
-from .neighborhood import select_neighbors, select_neighbors_st
+from .integration import (
+    integrate_soft_product, integrate_soft_product_batch,
+    integrate_soft_laplace, integrate_soft_laplace_batch,
+)
+from .neighborhood import (
+    select_neighbors, select_neighbors_st,
+    SpatialIndex, SpatialTemporalIndex,
+)
 from .soft_data import SoftPDF
 from .trend import estimate_trend
 
@@ -52,7 +67,8 @@ def bme_predict(ck, ch, zh,
                 model="exponential", params=None,
                 nhmax=20, nsmax=8, dmax=np.inf,
                 order=0, n_grid=200, ci_prob=0.95,
-                n_quad=15, mean_prior=0.0) -> List[BMEResult]:
+                n_quad=15, mean_prior=0.0,
+                n_jobs=1, method="auto") -> List[BMEResult]:
     """Full BME prediction at one or more estimation points.
 
     Combines the MATLAB functions ``BMEprobaPdf``, ``BMEprobaMode``,
@@ -75,6 +91,11 @@ def bme_predict(ck, ch, zh,
     ci_prob    : confidence-interval probability
     n_quad     : base Gauss-Hermite quadrature points
     mean_prior : prior mean (used when order = NaN)
+    n_jobs     : number of parallel workers (1 = serial; -1 = all CPUs).
+                 Requires ``joblib`` when > 1.
+    method     : integration method for soft data: ``'auto'`` (default),
+                 ``'gauss_hermite'``, ``'laplace'``, or ``'mc'``.
+                 ``'auto'`` selects Laplace when ns >= 6, GH otherwise.
 
     Returns
     -------
@@ -92,27 +113,59 @@ def bme_predict(ck, ch, zh,
     if params is None:
         params = [1.0, 1.0]
 
-    return [
-        _bme_point(ck[i], ch, zh, cs, soft_pdfs,
-                   model, params, nhmax, nsmax, dmax,
-                   order, n_grid, ci_prob, n_quad, mean_prior)
-        for i in range(ck.shape[0])
-    ]
+    # Build KD-tree indices once  (O(N log N))
+    _idx_h = SpatialIndex(ch)
+    _idx_s = SpatialIndex(cs) if len(soft_pdfs) > 0 else None
+
+    nk = ck.shape[0]
+
+    def _worker(i):
+        return _bme_point(ck[i], ch, zh, cs, soft_pdfs,
+                          model, params, nhmax, nsmax, dmax,
+                          order, n_grid, ci_prob, n_quad, mean_prior,
+                          _idx_h, _idx_s, method=method)
+
+    if n_jobs == 1 or nk <= 4:
+        return [_worker(i) for i in range(nk)]
+
+    # Parallel via joblib
+    try:
+        from joblib import Parallel, delayed
+    except ImportError:
+        warnings.warn("joblib not installed — falling back to serial. "
+                      "Install joblib for parallel BME:  pip install joblib",
+                      stacklevel=2)
+        return [_worker(i) for i in range(nk)]
+
+    return Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(_worker)(i) for i in range(nk)
+    )
 
 
 def _bme_point(ck, ch, zh, cs, soft_pdfs,
                model, params, nhmax, nsmax, dmax,
-               order, n_grid, ci_prob, n_quad, mean_prior):
-    """BME at a single estimation point."""
+               order, n_grid, ci_prob, n_quad, mean_prior,
+               idx_h=None, idx_s=None, method="auto"):
+    """BME at a single estimation point.
+
+    If *idx_h* / *idx_s* are ``SpatialIndex`` objects they are used for
+    O(log N) neighbour lookup; otherwise falls back to brute-force.
+    """
     res = BMEResult(ci_prob=ci_prob)
 
     # ── neighbourhood ──
-    idx_h = select_neighbors(ck, ch, len(zh), nhmax, dmax)
-    idx_s = select_neighbors(ck, cs, len(soft_pdfs), nsmax, dmax)
-    ch_l, zh_l = ch[idx_h], zh[idx_h]
-    cs_l = cs[idx_s] if len(idx_s) > 0 else np.empty((0, ck.shape[-1]))
-    sp_l = [soft_pdfs[i] for i in idx_s]
-    nh, ns = len(idx_h), len(idx_s)
+    if idx_h is not None:
+        idxh = idx_h.query(ck, nmax=nhmax, dmax=dmax)
+    else:
+        idxh = select_neighbors(ck, ch, len(zh), nhmax, dmax)
+    if idx_s is not None:
+        idxs = idx_s.query(ck, nmax=nsmax, dmax=dmax)
+    else:
+        idxs = select_neighbors(ck, cs, len(soft_pdfs), nsmax, dmax)
+    ch_l, zh_l = ch[idxh], zh[idxh]
+    cs_l = cs[idxs] if len(idxs) > 0 else np.empty((0, ck.shape[-1]))
+    sp_l = [soft_pdfs[i] for i in idxs]
+    nh, ns = len(idxh), len(idxs)
     res.n_hard, res.n_soft = nh, ns
 
     # ── duplicate check ──
@@ -201,7 +254,7 @@ def _bme_point(ck, ch, zh, cs, soft_pdfs,
     b_k = B[:, 0]
     b_const = B[:, 1:] @ zh_dt if nh > 0 else np.zeros(ns)
 
-    # ── evaluate posterior on z-grid ──
+    # ── evaluate posterior on z-grid (vectorised) ──
     sigma_k = math.sqrt(k_var)
     z_lo = k_mu - 5.0 * sigma_k
     z_hi = k_mu + 5.0 * sigma_k
@@ -210,15 +263,20 @@ def _bme_point(ck, ch, zh, cs, soft_pdfs,
         z_hi = max(z_hi, sp.support[1] + 2 * sigma_k)
     zg = np.linspace(z_lo, z_hi, n_grid)
 
-    pdf_raw = np.empty(n_grid)
-    for iz, zk in enumerate(zg):
-        prior = norm.pdf(zk, k_mu, sigma_k)
-        if prior < 1e-300:
-            pdf_raw[iz] = 0.0
-            continue
-        mu_s_kh = b_k * zk + b_const
-        I_num = integrate_soft_product(sp_dt, mu_s_kh, K_s_kh, n_quad)
-        pdf_raw[iz] = prior * I_num
+    prior = norm.pdf(zg, k_mu, sigma_k)
+    # mu_s_kh(z_k) = b_k * z_k + b_const  → (n_grid, ns)
+    mu_all = np.outer(zg, b_k) + b_const[None, :]
+
+    # Select integration method
+    _method = method
+    if _method == "auto":
+        _method = "laplace" if ns >= 6 else "gauss_hermite"
+    if _method == "laplace":
+        I_num = integrate_soft_laplace_batch(sp_dt, mu_all, K_s_kh)
+    else:
+        I_num = integrate_soft_product_batch(sp_dt, mu_all, K_s_kh, n_quad)
+    pdf_raw = prior * I_num
+    pdf_raw[prior < 1e-300] = 0.0
 
     area = float(_trapz(pdf_raw, zg))
     if area > 1e-300:
@@ -258,12 +316,23 @@ def bme_predict_st(ck, tk, ch, th, zh,
                    nhmax=20, nsmax=8,
                    dmax_s=np.inf, dmax_t=np.inf,
                    order=0, n_grid=200, ci_prob=0.95,
-                   n_quad=15, mean_prior=0.0) -> List[BMEResult]:
+                   n_quad=15, mean_prior=0.0,
+                   n_jobs=1, method="auto") -> List[BMEResult]:
     """Separable space-time BME prediction.
 
     C((x,t),(x',t')) = σ² · Cs(‖x−x'‖) · Ct(|t−t'|)
 
     Spatial and temporal models should have sill = 1 (overall sill in *sigma2*).
+
+    Parameters
+    ----------
+    n_jobs : int
+        Number of parallel workers (1 = serial; -1 = all CPUs).
+        Requires ``joblib`` when > 1.
+    method : str
+        Integration method for soft data: ``'auto'`` (default),
+        ``'gauss_hermite'``, ``'laplace'``, or ``'mc'``.
+        ``'auto'`` selects Laplace when ns >= 6, GH otherwise.
     """
     ck = np.atleast_2d(ck)
     ch = np.atleast_2d(ch)
@@ -281,123 +350,165 @@ def bme_predict_st(ck, tk, ch, th, zh,
     if params_t is None:
         params_t = [1.0, 1.0]
 
+    # Build KD-tree indices once
+    _st_idx_h = SpatialTemporalIndex(ch, th)
+    _st_idx_s = SpatialTemporalIndex(cs, ts) if len(soft_pdfs) > 0 else None
+
     def _stcov(c1, t1, c2, t2):
         return build_cov_matrix_st(c1, t1, c2, t2,
                                    model_s, params_s, model_t, params_t, sigma2)
 
-    results = []
-    for ik in range(ck.shape[0]):
-        res = BMEResult(ci_prob=ci_prob)
-        ck_i, tk_i = ck[ik:ik + 1], tk[ik:ik + 1]
+    nk = ck.shape[0]
 
-        idx_h = select_neighbors_st(ck[ik], tk[ik], ch, th, nhmax, dmax_s, dmax_t)
-        idx_s = (
-            select_neighbors_st(ck[ik], tk[ik], cs, ts, nsmax, dmax_s, dmax_t)
-            if len(soft_pdfs) else np.array([], dtype=int)
-        )
-        ch_l, th_l, zh_l = ch[idx_h], th[idx_h], zh[idx_h]
-        cs_l = cs[idx_s] if len(idx_s) else np.empty((0, d_dim))
-        ts_l = ts[idx_s] if len(idx_s) else np.array([])
-        sp_l = [soft_pdfs[i] for i in idx_s]
-        nh, ns = len(idx_h), len(idx_s)
-        res.n_hard, res.n_soft = nh, ns
-
-        sig2_loc = float(_stcov(ck_i, tk_i, ck_i, tk_i)[0, 0])
-
-        if nh == 0 and ns == 0:
-            results.append(_fill_prior(res, mean_prior, sig2_loc, n_grid, ci_prob))
-            continue
-
-        zh_dt, sp_dt, mk, _, _ = estimate_trend(
-            ch_l, zh_l, cs_l, sp_l, ck[ik], order, mean_prior
+    def _worker(ik):
+        return _bme_st_point(
+            ck[ik], tk[ik], ch, th, zh, cs, ts, soft_pdfs,
+            _stcov, nhmax, nsmax, dmax_s, dmax_t,
+            order, n_grid, ci_prob, n_quad, mean_prior, d_dim,
+            _st_idx_h, _st_idx_s, method=method,
         )
 
-        if nh > 0:
-            Ckh = _stcov(ck_i, tk_i, ch_l, th_l)
-            Chh = _stcov(ch_l, th_l, ch_l, th_l) + np.eye(nh) * 1e-10
-            Lhh = linalg.cholesky(Chh, lower=True)
-        if ns > 0:
-            Cks = _stcov(ck_i, tk_i, cs_l, ts_l)
-            Css = _stcov(cs_l, ts_l, cs_l, ts_l) + np.eye(ns) * 1e-10
-            if nh > 0:
-                Chs = _stcov(ch_l, th_l, cs_l, ts_l)
-
-        if nh > 0:
-            k_mu = float((Ckh @ linalg.cho_solve((Lhh, True), zh_dt)).ravel()[0])
-            k_var = max(float((sig2_loc - Ckh @ linalg.cho_solve((Lhh, True), Ckh.T)).ravel()[0]), 1e-12)
-        else:
-            k_mu, k_var = 0.0, sig2_loc
-        res.kriging_mean, res.kriging_var = k_mu + mk, k_var
-
-        if ns == 0:
-            results.append(_fill_gaussian(res, k_mu, k_var, mk, n_grid, ci_prob))
-            continue
-
-        # full BME integration
-        nkh = 1 + nh
-        C_kh_kh = np.zeros((nkh, nkh))
-        C_kh_kh[0, 0] = sig2_loc
-        if nh > 0:
-            C_kh_kh[0, 1:] = C_kh_kh[1:, 0] = Ckh.ravel()
-            C_kh_kh[1:, 1:] = Chh
-        C_kh_kh += np.eye(nkh) * 1e-10
-        C_s_kh = np.zeros((ns, nkh))
-        C_s_kh[:, 0] = Cks.ravel()
-        if nh > 0:
-            C_s_kh[:, 1:] = Chs.T
-
-        if nh > 0:
-            mu_s_h = (Chs.T @ linalg.cho_solve((Lhh, True), zh_dt)).ravel()
-            K_s_h = Css - Chs.T @ linalg.cho_solve((Lhh, True), Chs)
-        else:
-            mu_s_h, K_s_h = np.zeros(ns), Css.copy()
-        K_s_h = 0.5 * (K_s_h + K_s_h.T) + np.eye(ns) * 1e-10
-        integrate_soft_product(sp_dt, mu_s_h, K_s_h, n_quad)  # denominator
-
-        L_kh = linalg.cholesky(C_kh_kh, lower=True)
-        K_s_kh = Css - C_s_kh @ linalg.cho_solve((L_kh, True), C_s_kh.T)
-        K_s_kh = 0.5 * (K_s_kh + K_s_kh.T) + np.eye(ns) * 1e-10
-
-        B = C_s_kh @ np.linalg.inv(C_kh_kh)
-        b_k = B[:, 0]
-        b_c = B[:, 1:] @ zh_dt if nh > 0 else np.zeros(ns)
-
-        sigma_k = math.sqrt(k_var)
-        z_lo = k_mu - 5 * sigma_k
-        z_hi = k_mu + 5 * sigma_k
-        for sp in sp_dt:
-            z_lo = min(z_lo, sp.support[0] - 2 * sigma_k)
-            z_hi = max(z_hi, sp.support[1] + 2 * sigma_k)
-        zg = np.linspace(z_lo, z_hi, n_grid)
-
-        pdf_raw = np.empty(n_grid)
-        for iz, zk in enumerate(zg):
-            pr = norm.pdf(zk, k_mu, sigma_k)
-            if pr < 1e-300:
-                pdf_raw[iz] = 0.0
-                continue
-            pdf_raw[iz] = pr * integrate_soft_product(
-                sp_dt, b_k * zk + b_c, K_s_kh, n_quad
-            )
-
-        area = float(_trapz(pdf_raw, zg))
-        pdf_n = pdf_raw / area if area > 1e-300 else norm.pdf(zg, k_mu, sigma_k)
-        zg_f = zg + mk
-
-        res.mode = zg_f[int(np.argmax(pdf_n))]
-        res.mean = float(_trapz(zg_f * pdf_n, zg))
-        res.variance = max(float(_trapz((zg_f - res.mean) ** 2 * pdf_n, zg)), 1e-12)
-        m3 = float(_trapz((zg_f - res.mean) ** 3 * pdf_n, zg))
-        res.skewness = m3 / res.variance ** 1.5 if res.variance > 1e-14 else 0.0
-        cdf = np.cumsum(pdf_n) * np.mean(np.diff(zg))
-        cdf /= cdf[-1]
-        al = (1 - ci_prob) / 2
-        res.ci_lower = zg_f[np.clip(np.searchsorted(cdf, al), 0, n_grid - 1)]
-        res.ci_upper = zg_f[np.clip(np.searchsorted(cdf, 1 - al), 0, n_grid - 1)]
-        res.z_grid, res.pdf = zg_f, pdf_n
-        res.info = f"full_st_bme nh={nh} ns={ns}"
-        results.append(res)
+    if n_jobs == 1 or nk <= 4:
+        results = [_worker(ik) for ik in range(nk)]
+    else:
+        try:
+            from joblib import Parallel, delayed
+        except ImportError:
+            warnings.warn("joblib not installed — falling back to serial.",
+                          stacklevel=2)
+            return [_worker(ik) for ik in range(nk)]
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_worker)(ik) for ik in range(nk)
+        )
     return results
+
+
+def _bme_st_point(ck_i, tk_i, ch, th, zh, cs, ts, soft_pdfs,
+                  stcov_fn, nhmax, nsmax, dmax_s, dmax_t,
+                  order, n_grid, ci_prob, n_quad, mean_prior, d_dim,
+                  idx_h=None, idx_s=None, method="auto"):
+    """Space-time BME at a single point, with optional KD-tree indices."""
+    res = BMEResult(ci_prob=ci_prob)
+    ck_2d = ck_i.reshape(1, -1)
+    tk_1d = np.atleast_1d(tk_i)
+
+    # ── neighbourhood ──
+    if idx_h is not None:
+        idxh = idx_h.query(ck_i, tk_i, nmax=nhmax, dmax_s=dmax_s, dmax_t=dmax_t)
+    else:
+        idxh = select_neighbors_st(ck_i, tk_i, ch, th, nhmax, dmax_s, dmax_t)
+    if idx_s is not None:
+        idxs = idx_s.query(ck_i, tk_i, nmax=nsmax, dmax_s=dmax_s, dmax_t=dmax_t)
+    elif len(soft_pdfs):
+        idxs = select_neighbors_st(ck_i, tk_i, cs, ts, nsmax, dmax_s, dmax_t)
+    else:
+        idxs = np.array([], dtype=int)
+
+    ch_l, th_l, zh_l = ch[idxh], th[idxh], zh[idxh]
+    cs_l = cs[idxs] if len(idxs) else np.empty((0, d_dim))
+    ts_l = ts[idxs] if len(idxs) else np.array([])
+    sp_l = [soft_pdfs[i] for i in idxs]
+    nh, ns = len(idxh), len(idxs)
+    res.n_hard, res.n_soft = nh, ns
+
+    sig2_loc = float(stcov_fn(ck_2d, tk_1d, ck_2d, tk_1d)[0, 0])
+
+    if nh == 0 and ns == 0:
+        return _fill_prior(res, mean_prior, sig2_loc, n_grid, ci_prob)
+
+    zh_dt, sp_dt, mk, _, _ = estimate_trend(
+        ch_l, zh_l, cs_l, sp_l, ck_i, order, mean_prior
+    )
+
+    if nh > 0:
+        Ckh = stcov_fn(ck_2d, tk_1d, ch_l, th_l)
+        Chh = stcov_fn(ch_l, th_l, ch_l, th_l) + np.eye(nh) * 1e-10
+        Lhh = linalg.cholesky(Chh, lower=True)
+    if ns > 0:
+        Cks = stcov_fn(ck_2d, tk_1d, cs_l, ts_l)
+        Css = stcov_fn(cs_l, ts_l, cs_l, ts_l) + np.eye(ns) * 1e-10
+        if nh > 0:
+            Chs = stcov_fn(ch_l, th_l, cs_l, ts_l)
+
+    if nh > 0:
+        k_mu = float((Ckh @ linalg.cho_solve((Lhh, True), zh_dt)).ravel()[0])
+        k_var = max(float((sig2_loc - Ckh @ linalg.cho_solve((Lhh, True), Ckh.T)).ravel()[0]), 1e-12)
+    else:
+        k_mu, k_var = 0.0, sig2_loc
+    res.kriging_mean, res.kriging_var = k_mu + mk, k_var
+
+    if ns == 0:
+        return _fill_gaussian(res, k_mu, k_var, mk, n_grid, ci_prob)
+
+    # full BME integration
+    nkh = 1 + nh
+    C_kh_kh = np.zeros((nkh, nkh))
+    C_kh_kh[0, 0] = sig2_loc
+    if nh > 0:
+        C_kh_kh[0, 1:] = C_kh_kh[1:, 0] = Ckh.ravel()
+        C_kh_kh[1:, 1:] = Chh
+    C_kh_kh += np.eye(nkh) * 1e-10
+    C_s_kh = np.zeros((ns, nkh))
+    C_s_kh[:, 0] = Cks.ravel()
+    if nh > 0:
+        C_s_kh[:, 1:] = Chs.T
+
+    if nh > 0:
+        mu_s_h = (Chs.T @ linalg.cho_solve((Lhh, True), zh_dt)).ravel()
+        K_s_h = Css - Chs.T @ linalg.cho_solve((Lhh, True), Chs)
+    else:
+        mu_s_h, K_s_h = np.zeros(ns), Css.copy()
+    K_s_h = 0.5 * (K_s_h + K_s_h.T) + np.eye(ns) * 1e-10
+    integrate_soft_product(sp_dt, mu_s_h, K_s_h, n_quad)  # denominator
+
+    L_kh = linalg.cholesky(C_kh_kh, lower=True)
+    K_s_kh = Css - C_s_kh @ linalg.cho_solve((L_kh, True), C_s_kh.T)
+    K_s_kh = 0.5 * (K_s_kh + K_s_kh.T) + np.eye(ns) * 1e-10
+
+    B = C_s_kh @ np.linalg.inv(C_kh_kh)
+    b_k = B[:, 0]
+    b_c = B[:, 1:] @ zh_dt if nh > 0 else np.zeros(ns)
+
+    sigma_k = math.sqrt(k_var)
+    z_lo = k_mu - 5 * sigma_k
+    z_hi = k_mu + 5 * sigma_k
+    for sp in sp_dt:
+        z_lo = min(z_lo, sp.support[0] - 2 * sigma_k)
+        z_hi = max(z_hi, sp.support[1] + 2 * sigma_k)
+    zg = np.linspace(z_lo, z_hi, n_grid)
+
+    # Vectorised z-grid integration
+    prior = norm.pdf(zg, k_mu, sigma_k)
+    mu_all = np.outer(zg, b_k) + b_c[None, :]
+
+    # Select integration method
+    _method = method
+    if _method == "auto":
+        _method = "laplace" if ns >= 6 else "gauss_hermite"
+    if _method == "laplace":
+        I_num = integrate_soft_laplace_batch(sp_dt, mu_all, K_s_kh)
+    else:
+        I_num = integrate_soft_product_batch(sp_dt, mu_all, K_s_kh, n_quad)
+    pdf_raw = prior * I_num
+    pdf_raw[prior < 1e-300] = 0.0
+
+    area = float(_trapz(pdf_raw, zg))
+    pdf_n = pdf_raw / area if area > 1e-300 else norm.pdf(zg, k_mu, sigma_k)
+    zg_f = zg + mk
+
+    res.mode = zg_f[int(np.argmax(pdf_n))]
+    res.mean = float(_trapz(zg_f * pdf_n, zg))
+    res.variance = max(float(_trapz((zg_f - res.mean) ** 2 * pdf_n, zg)), 1e-12)
+    m3 = float(_trapz((zg_f - res.mean) ** 3 * pdf_n, zg))
+    res.skewness = m3 / res.variance ** 1.5 if res.variance > 1e-14 else 0.0
+    cdf = np.cumsum(pdf_n) * np.mean(np.diff(zg))
+    cdf /= cdf[-1]
+    al = (1 - ci_prob) / 2
+    res.ci_lower = zg_f[np.clip(np.searchsorted(cdf, al), 0, n_grid - 1)]
+    res.ci_upper = zg_f[np.clip(np.searchsorted(cdf, 1 - al), 0, n_grid - 1)]
+    res.z_grid, res.pdf = zg_f, pdf_n
+    res.info = f"full_st_bme nh={nh} ns={ns}"
+    return res
 
 
 # ── helpers ──────────────────────────────────────────────────

@@ -9,6 +9,8 @@ A pure-Python implementation of the Bayesian Maximum Entropy (BME) framework for
 * **6 covariance models** — exponential, Gaussian, spherical, Matérn, nugget, hole-cosine — with nesting support.
 * **Neighbourhood selection**, polynomial trend (order 0/1/2 / simple kriging), REML covariance fitting, leave-one-out cross-validation.
 * **Separable space-time BME** with independent spatial and temporal covariance models.
+* **SPDE / GMRF sparse-precision kriging** — Matérn fields on FEM meshes with O(n^{3/2}) Cholesky; hard-data kriging only (see [limitations](#when-to-use-which-approach)). *(v0.3.0, original contribution)*
+* **Laplace approximation** for soft-data integration within `bme_predict` — O(ns³) per point, replacing exponential-cost GH quadrature when ns is large. *(v0.3.0, original contribution)*
 
 ---
 
@@ -36,6 +38,23 @@ If you use PyBME in published work please cite the original BMElib:
 > Assessment*, **13**, 1–26.  <https://doi.org/10.1007/s004770050030>
 
 BMElib homepage: <http://www.unc.edu/depts/case/BMElib/>
+
+### INLA-SPDE extensions (v0.3.0)
+
+The SPDE/GMRF sparse-precision module and Laplace approximation for
+soft-data integration are **original contributions by Corinne Wiesner-Friedman**
+and are not part of the original MATLAB BMElib.  These features are inspired by
+the INLA-SPDE methodology.  If you use them please also cite:
+
+> Lindgren F., Rue H. & Lindström J. (2011).  An explicit link between Gaussian
+> fields and Gaussian Markov random fields: the stochastic partial differential
+> equation approach.  *Journal of the Royal Statistical Society: Series B*,
+> **73**(4), 423–498.  <https://doi.org/10.1111/j.1467-9868.2011.00777.x>
+
+> Rue H., Martino S. & Chopin N. (2009).  Approximate Bayesian inference for
+> latent Gaussian models by using integrated nested Laplace approximations.
+> *Journal of the Royal Statistical Society: Series B*, **71**(2), 319–392.
+> <https://doi.org/10.1111/j.1467-9868.2008.00700.x>
 
 ---
 
@@ -89,8 +108,9 @@ pybme/
 │       ├── soft_data.py         # SoftPDF class with 10+ constructors
 │       ├── neighborhood.py      # spatial & space-time neighbour selection
 │       ├── trend.py             # polynomial design matrix + trend estimation
-│       ├── integration.py       # Gauss-Hermite / Monte Carlo integration
+│       ├── integration.py       # Gauss-Hermite / Monte Carlo / Laplace integration
 │       ├── predict.py           # bme_predict, bme_predict_st, BMEResult
+│       ├── spde.py              # SPDE/GMRF sparse-precision Matérn fields (v0.3)
 │       ├── fitting.py           # REML covariance fitting
 │       └── validation.py        # leave-one-out cross-validation
 ├── tests/
@@ -165,6 +185,22 @@ results = bme_predict_st(ck, tk, ch, th, zh,
                          sigma2=1.0)
 ```
 
+**Integration method** (v0.3.0): both `bme_predict` and `bme_predict_st` accept
+a `method` parameter:
+
+| Value | Algorithm | When to use |
+|---|---|---|
+| `"auto"` *(default)* | Laplace if ns ≥ 6, else GH | General purpose |
+| `"gauss_hermite"` | Tensor-product Gauss-Hermite | ns ≤ 8, exact posterior shape |
+| `"laplace"` | Laplace approximation | Many soft neighbours (ns ≫ 8) |
+| `"mc"` | Monte Carlo sampling | Very high dimensions or diagnostics |
+
+```python
+# Force Laplace approximation for large soft-data problems
+results = bme_predict(ck, ch, zh, cs, soft_pdfs,
+                      model, params, method="laplace")
+```
+
 Each `BMEResult` contains:
 
 | Attribute | Description |
@@ -186,6 +222,67 @@ fit = fit_covariance(ch, zh, model="exponential", order=0)
 cv = cross_validate(ch, zh, model="exponential", params=[fit['sill'], fit['range']])
 # → {'rmse': ..., 'mae': ..., 'predicted': ..., 'errors': ...}
 ```
+
+### SPDE / GMRF kriging *(v0.3.0 — original contribution)*
+
+Sparse-precision kriging on a FEM triangular mesh, bypassing the dense
+covariance matrix entirely.  **This is hard-data (kriging) only** — it does
+not integrate soft probabilistic data.  For full BME with soft data, use
+`bme_predict()` with `method="laplace"` (see above).
+
+```python
+from pybme import SPDEMesh, build_precision_matrix, spde_kriging, snap_to_mesh
+
+# Build a Delaunay mesh from observation coordinates
+mesh = SPDEMesh.from_points(coords_2d, margin=0.1)
+
+# Convert Matérn parameters to SPDE form
+from pybme.spde import matern_to_spde_params
+kappa, tau = matern_to_spde_params(sigma2=1.0, range_param=10.0, nu=1.0)
+
+# Sparse precision matrix Q (n × n, O(n) non-zeros)
+Q = build_precision_matrix(mesh, kappa, tau, alpha=2)
+
+# Map observation coordinates to nearest mesh nodes
+obs_idx = snap_to_mesh(obs_coords, mesh)
+
+# Kriging via sparse Cholesky — O(n^{3/2}) in 2-D
+mu, var = spde_kriging(mesh, Q, obs_idx, z_obs, nugget=0.01)
+```
+
+**Limitations of `spde_kriging`:**
+
+| Constraint | Detail |
+|---|---|
+| Hard data only | No soft-data (PDF) integration — use `bme_predict()` for that |
+| Simple kriging only | Assumes zero mean; no trend estimation (order 0/1/2) |
+| 2-D spatial only | Mesh is Delaunay triangulation in ℝ²; no 1-D, 3-D, or space-time |
+| Matérn covariance only | The SPDE link is specific to the Matérn family (ν = α − d/2) |
+| Mesh-node predictions | Predictions are returned at mesh nodes — use `snap_to_mesh()` to map |
+
+---
+
+### When to use which approach
+
+| Scenario | Recommended approach | Why |
+|---|---|---|
+| **Hard + soft data, ns ≤ 5** | `bme_predict()` with default `method="auto"` | GH quadrature is exact and fast for few soft points |
+| **Hard + soft data, ns ≥ 6** | `bme_predict(..., method="laplace")` | Laplace scales as O(ns³) vs exponential for GH |
+| **Hard data only, any covariance** | `bme_predict()` with no `cs`/`soft_pdfs` | Falls back to standard kriging internally |
+| **Hard data only, Matérn, large 2-D field** | `spde_kriging()` | Sparse Cholesky is O(n^{3/2}) vs O(n³) dense |
+| **Very high ns or diagnostics** | `bme_predict(..., method="mc")` | Monte Carlo — unbiased but higher variance |
+| **Space-time with soft data** | `bme_predict_st()` | Separable S/T kernel; supports all `method` options |
+
+**In short:**
+
+* Use **`bme_predict()`** (the standard BME pipeline) whenever you have
+  soft probabilistic data — it supports all covariance models, trend
+  orders, and the full posterior PDF.  The `method` parameter controls
+  only *how* the soft-data integral is computed (GH / Laplace / MC).
+* Use **`spde_kriging()`** when you have a large 2-D spatial field with
+  **hard data only**, Matérn covariance, and need the computational
+  savings of sparse linear algebra.  It is *not* a replacement for full
+  BME — it is an alternative kriging back-end for the hard-data-only case.
 
 ---
 
@@ -215,7 +312,8 @@ cd pybme
 pytest
 ```
 
-Expected output: ~50 tests across 5 test files matching the MATLAB BMElib test suite structure.
+Expected output: ~76 tests across 7 test files matching the MATLAB BMElib test suite structure
+plus SPDE and Laplace integration tests.
 
 ---
 
@@ -229,7 +327,13 @@ $$
 f(z_k | \text{data}) \propto \underbrace{p(z_k | z_{\text{hard}})}_{\text{kriging prior}} \times \underbrace{\int \prod_i f_{S_i}(s_i) \, p(s_1, \dots, s_{n_s} | z_k, z_{\text{hard}}) \, ds}_{\text{soft-data likelihood}}
 $$
 
-The integral is evaluated numerically using **Gauss-Hermite tensor-product quadrature** (≤ 8 soft data dimensions) with **Monte Carlo fallback** for higher dimensions.  This preserves the full non-Gaussian shape of the posterior — unlike moment-matching approaches that force a Gaussian approximation.
+The integral is evaluated numerically using one of three strategies:
+
+1. **Gauss-Hermite tensor-product quadrature** (default for ns ≤ 5) — exact up to polynomial degree, preserves the full non-Gaussian shape of the posterior.
+2. **Laplace approximation** (default for ns ≥ 6, v0.3.0) — finds the posterior mode and uses a second-order Taylor expansion of the log-posterior, giving O(ns³) per point instead of exponential cost.  Based on the INLA methodology of Rue et al. (2009).
+3. **Monte Carlo sampling** — fallback for very high dimensions or when requested explicitly.
+
+Unlike moment-matching approaches, all three methods can capture the non-Gaussian shape of the posterior when soft data is non-Gaussian.
 
 ---
 
@@ -239,7 +343,9 @@ The integral is evaluated numerically using **Gauss-Hermite tensor-product quadr
 |---|---|---|
 | Language | MATLAB + Fortran MEX | Pure Python (NumPy/SciPy) |
 | Soft-data types | 4 softpdftype codes | 10+ named constructors |
-| Integration engine | Fortran mvPro / mvProAG2 | Gauss-Hermite quadrature + MC |
+| Integration engine | Fortran mvPro / mvProAG2 | GH quadrature + Laplace + MC |
+| SPDE / GMRF kriging | — | `spde_kriging()` on FEM mesh (hard data only) |
+| Laplace approximation | — | `method="laplace"` in `bme_predict` (full BME) |
 | Space-time | Full S/T framework | Separable S/T |
 | Covariance fitting | Manual | REML auto-fit |
 | Cross-validation | Manual scripting | Built-in `cross_validate()` |

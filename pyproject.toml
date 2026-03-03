@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pybme"
-version = "0.1.0"
+version = "0.3.0"
 description = "Bayesian Maximum Entropy geostatistical library — a Python port of MATLAB BMElib (Serre & Christakos)."
 readme = "README.md"
 license = {text = "MIT"}
