@@ -2,7 +2,7 @@
 
 **Author:** Corinne Wiesner-Friedman
 
-A pure-Python implementation of the Bayesian Maximum Entropy (BME) framework for spatial and space-time geostatistical estimation.  PyBME is a modern port of the core algorithms in the [MATLAB BMElib 2.0](http://www.unc.edu/depts/case/BMElib/) library and includes:
+A pure-Python implementation of the Bayesian Maximum Entropy (BME) framework for spatial and space-time geostatistical estimation.  PyBME is a modern port of the core algorithms in the [MATLAB BMElib 2.0](http://www.unc.edu/depts/case/BMElib/](https://mserre.sph.unc.edu/BMElib_web/BMELIB.htm ) library and includes:
 
 * **True non-Gaussian soft-data integration** via Gauss-Hermite tensor-product quadrature (replaces moment-matching).
 * **10+ soft-data types** — Gaussian, uniform / interval, triangular, truncated-normal, lognormal, histogram, callable, mixture.
