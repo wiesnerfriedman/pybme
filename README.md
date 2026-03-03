@@ -11,6 +11,7 @@ A pure-Python implementation of the Bayesian Maximum Entropy (BME) framework for
 * **Separable space-time BME** with independent spatial and temporal covariance models.
 * **SPDE / GMRF sparse-precision kriging** — Matérn fields on FEM meshes with O(n^{3/2}) Cholesky; hard-data kriging only (see [limitations](#when-to-use-which-approach)). *(v0.3.0, original contribution)*
 * **Laplace approximation** for soft-data integration within `bme_predict` — O(ns³) per point, replacing exponential-cost GH quadrature when ns is large. *(v0.3.0, original contribution)*
+* **Expectation Propagation (EP)**, **Quasi-Monte Carlo (QMC)**, and **Laplace Importance Sampling (LIS)** — three additional integration methods for diverse soft-data scenarios. *(v0.4.0, original contribution)*
 
 ---
 
@@ -108,7 +109,7 @@ pybme/
 │       ├── soft_data.py         # SoftPDF class with 10+ constructors
 │       ├── neighborhood.py      # spatial & space-time neighbour selection
 │       ├── trend.py             # polynomial design matrix + trend estimation
-│       ├── integration.py       # Gauss-Hermite / Monte Carlo / Laplace integration
+│       ├── integration.py       # GH / Laplace / EP / QMC / LIS / MC integration
 │       ├── predict.py           # bme_predict, bme_predict_st, BMEResult
 │       ├── spde.py              # SPDE/GMRF sparse-precision Matérn fields (v0.3)
 │       ├── fitting.py           # REML covariance fitting
@@ -185,15 +186,18 @@ results = bme_predict_st(ck, tk, ch, th, zh,
                          sigma2=1.0)
 ```
 
-**Integration method** (v0.3.0): both `bme_predict` and `bme_predict_st` accept
+**Integration method** (v0.3.0, expanded v0.4.0): both `bme_predict` and `bme_predict_st` accept
 a `method` parameter:
 
 | Value | Algorithm | When to use |
 |---|---|---|
-| `"auto"` *(default)* | Laplace if ns ≥ 6, else GH | General purpose |
-| `"gauss_hermite"` | Tensor-product Gauss-Hermite | ns ≤ 8, exact posterior shape |
-| `"laplace"` | Laplace approximation | Many soft neighbours (ns ≫ 8) |
-| `"mc"` | Monte Carlo sampling | Very high dimensions or diagnostics |
+| `"auto"` *(default)* | Laplace if ns ≥ 6, else GH | General purpose — good default for any problem |
+| `"gauss_hermite"` | Tensor-product Gauss-Hermite | ns ≤ 5–8, exact posterior shape |
+| `"laplace"` | Laplace approximation | Many soft neighbours (ns ≫ 8), near-Gaussian soft PDFs |
+| `"ep"` | Expectation Propagation | Non-log-concave soft PDFs (uniforms, intervals, bimodal) |
+| `"qmc"` | Quasi-Monte Carlo (Sobol) | Moderate ns (3–20), O(1/N) convergence — better than MC |
+| `"lis"` | Laplace Importance Sampling | Unbiased correction to Laplace, low-variance alternative to MC |
+| `"mc"` | Monte Carlo sampling | Very high dimensions or diagnostics (highest cost) |
 
 ```python
 # Force Laplace approximation for large soft-data problems
