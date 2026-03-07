@@ -28,15 +28,29 @@ Requirements: Python ≥ 3.10, NumPy ≥ 1.24, SciPy ≥ 1.10.  Matplotlib is op
 
 ## Attribution
 
-PyBME is a Python port of **BMElib 2.0**, the MATLAB Bayesian Maximum Entropy
-library developed by **Marc L. Serre** and **George Christakos** at the
-University of North Carolina at Chapel Hill.
+PyBME is a Python port of **BMElib 2.0**, the MATLAB library for
+**Bayesian Maximum Entropy** (BME) — an information-theoretic geostatistical
+framework that maximises Shannon entropy subject to physical knowledge
+constraints.  BMElib was developed by **Marc L. Serre** and
+**George Christakos** at the University of North Carolina at Chapel Hill.
 
-If you use PyBME in published work please cite the original BMElib:
+If you use PyBME in published work please cite the original BMElib and the
+foundational BME references:
 
 > Serre M.L. & Christakos G. (1999).  Modern geostatistics for environmental
 > and health sciences: BMElib.  *Stochastic Environmental Research and Risk
 > Assessment*, **13**, 1–26.  <https://doi.org/10.1007/s004770050030>
+
+> Christakos G. (1990).  A Bayesian/maximum-entropy view to the spatial
+> estimation problem.  *Mathematical Geology*, **22**(7), 763–777.
+> <https://doi.org/10.1007/BF00890661>
+
+> Christakos G. (2000).  *Modern Spatiotemporal Geostatistics*.  Oxford
+> University Press, New York.
+
+> Christakos G., Bogaert P. & Serre M.L. (2002).  *Temporal GIS: Advanced
+> Functions for Field-Based Applications*.  Springer-Verlag, Berlin.
+> <https://doi.org/10.1007/978-3-642-56540-3>
 
 BMElib homepage: <http://www.unc.edu/depts/case/BMElib/>
 
@@ -326,15 +340,32 @@ plus SPDE, Laplace, EP, QMC, and LIS integration tests.
 
 ## How it works
 
-BME prediction integrates **hard data** (exact measurements) and **soft probabilistic data** (PDFs representing uncertain knowledge) using Bayesian conditioning on a Gaussian random field prior.
+BME (Bayesian Maximum Entropy) is a two-stage geostatistical estimation
+framework developed by Christakos (1990, 2000) and Serre (1999):
 
-For each estimation point $\mathbf{x}_k$:
+**Stage A — General Knowledge:**  The mean and covariance structure of the
+random field define global constraints.  Maximising Shannon entropy subject
+to these constraints yields the *prior* PDF $f_G$, which for a field with
+known mean and covariance is the multivariate Gaussian.
+
+**Stage B — Specificatory Knowledge:**  Site-specific data is integrated
+into the prior.  **Hard data** (exact measurements) condition $f_G$ exactly;
+**soft data** (PDFs representing uncertain knowledge at nearby locations)
+are integrated out, yielding the BME posterior $f_K(z_k)$.
+
+For each estimation point $\mathbf{x}_k$, the BME posterior PDF is:
 
 $$
-f(z_k | \text{data}) \propto \underbrace{p(z_k | z_{\text{hard}})}_{\text{kriging prior}} \times \underbrace{\int \prod_i f_{S_i}(s_i) \, p(s_1, \dots, s_{n_s} | z_k, z_{\text{hard}}) \, ds}_{\text{soft-data likelihood}}
+f_K(z_k) = A^{-1} \underbrace{p(z_k \mid z_{\text{hard}})}_{\text{hard-data conditional (kriging)}} \times \underbrace{\int \prod_{i=1}^{n_s} f_{S_i}(s_i) \; p(s_1, \dots, s_{n_s} \mid z_k, z_{\text{hard}}) \, d\mathbf{s}}_{\text{soft-data integration}}
 $$
 
-The integral is evaluated numerically using one of six strategies:
+where $p(z_k \mid z_{\text{hard}})$ is the Gaussian conditional from kriging,
+$f_{S_i}$ is the soft PDF at the $i$-th soft-data location,
+$p(\mathbf{s} \mid z_k, z_{\text{hard}})$ is the Gaussian conditional of the
+soft-data values given $z_k$ and the hard data, and $A$ is a normalising
+constant.
+
+The soft-data integral is evaluated numerically using one of six strategies:
 
 1. **Gauss-Hermite tensor-product quadrature** (default for ns ≤ 5) — exact up to polynomial degree, preserves the full non-Gaussian shape of the posterior.
 2. **Laplace approximation** (default for ns ≥ 6, v0.3.0) — finds the posterior mode and uses a second-order Taylor expansion of the log-posterior, giving O(ns³) per point instead of exponential cost.  Based on the INLA methodology of Rue et al. (2009).
@@ -343,7 +374,7 @@ The integral is evaluated numerically using one of six strategies:
 5. **Laplace Importance Sampling (LIS)** (v0.4.0) — uses the Laplace mode and Hessian as a Gaussian proposal for importance sampling.  Unbiased (unlike Laplace alone) with greatly reduced variance compared to plain MC.
 6. **Monte Carlo sampling** — fallback for very high dimensions or when requested explicitly.
 
-Unlike moment-matching approaches, all three methods can capture the non-Gaussian shape of the posterior when soft data is non-Gaussian.
+Unlike moment-matching approaches, all six methods can capture the non-Gaussian shape of the posterior when soft data is non-Gaussian.
 
 ---
 
