@@ -31,7 +31,7 @@ Requirements: Python ≥ 3.10, NumPy ≥ 1.24, SciPy ≥ 1.10.  Matplotlib is op
 PyBME is a Python port of **BMElib 2.0**, the MATLAB library for
 **Bayesian Maximum Entropy** (BME) — an information-theoretic geostatistical
 framework that maximises Shannon entropy subject to physical knowledge
-constraints.  BMElib was developed by **Marc L. Serre** and
+constraints.  BMElib was developed by **Marc L. Serre**, **Patrick Bogaert**, and
 **George Christakos** at the University of North Carolina at Chapel Hill.
 
 If you use PyBME in published work please cite the original BMElib and the
