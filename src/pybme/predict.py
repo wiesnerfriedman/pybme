@@ -22,7 +22,7 @@ import numpy as np
 from scipy import linalg
 from scipy.stats import norm
 
-from .covariance import build_cov_matrix, build_cov_matrix_st
+from .covariance import build_cov_matrix, build_cov_matrix_st, eval_cov
 from .distance import coord2dist
 from .integration import (
     integrate_soft_product, integrate_soft_product_batch,
@@ -529,6 +529,430 @@ def _bme_st_point(ck_i, tk_i, ch, th, zh, cs, ts, soft_pdfs,
     res.ci_upper = zg_f[np.clip(np.searchsorted(cdf, 1 - al), 0, n_grid - 1)]
     res.z_grid, res.pdf = zg_f, pdf_n
     res.info = f"full_st_bme nh={nh} ns={ns}"
+    return res
+
+
+# ── helpers ──────────────────────────────────────────────────
+
+
+# ════════════════════════════════════════════════════════════════
+# NETWORK BME  — spatial
+# ════════════════════════════════════════════════════════════════
+
+def bme_predict_network(
+    ck_nodes, ch_nodes, zh,
+    cs_nodes=None, soft_pdfs=None,
+    net_cov=None,
+    nhmax=20, nsmax=8,
+    order=0, n_grid=200, ci_prob=0.95,
+    n_quad=15, mean_prior=0.0,
+    method="auto",
+) -> List[BMEResult]:
+    """BME prediction on a network domain (spatial, graph-Laplacian covariance).
+
+    Instead of coordinates + Euclidean model, the covariance blocks are
+    extracted from a ``NetworkCovariance`` object that encodes the graph
+    topology.
+
+    Parameters
+    ----------
+    ck_nodes   : (nk,) integer array — estimation node indices.
+    ch_nodes   : (nh,) integer array — hard-data node indices.
+    zh         : (nh,) hard-data values.
+    cs_nodes   : (ns,) integer array — soft-data node indices (optional).
+    soft_pdfs  : list[SoftPDF] one per soft point (optional).
+    net_cov    : NetworkCovariance instance.
+    nhmax      : max hard neighbours (by graph proximity — NOT used here;
+                 all provided hard data within the graph is used unless
+                 you pre-filter externally).
+    nsmax      : max soft neighbours (same caveat).
+    order      : trend order (0 = ordinary kriging with constant mean).
+                 Only 0 and NaN (simple) are supported for network BME.
+    n_grid     : z-grid resolution for posterior PDF.
+    ci_prob    : confidence-interval probability.
+    n_quad     : Gauss-Hermite quadrature points (GH method).
+    mean_prior : prior mean (used when order = NaN).
+    method     : integration method: ``'auto'``, ``'gauss_hermite'``,
+                 ``'laplace'``, ``'ep'``, ``'qmc'``, ``'lis'``, ``'mc'``.
+
+    Returns
+    -------
+    list[BMEResult]
+    """
+    if net_cov is None:
+        raise ValueError("net_cov (NetworkCovariance) is required.")
+
+    ck_nodes = np.atleast_1d(np.asarray(ck_nodes, dtype=int))
+    ch_nodes = np.atleast_1d(np.asarray(ch_nodes, dtype=int))
+    zh = np.asarray(zh, dtype=np.float64)
+
+    if cs_nodes is None or soft_pdfs is None:
+        cs_nodes = np.array([], dtype=int)
+        soft_pdfs = []
+    else:
+        cs_nodes = np.atleast_1d(np.asarray(cs_nodes, dtype=int))
+
+    nk = len(ck_nodes)
+    return [
+        _bme_network_point(
+            ck_nodes[i], ch_nodes, zh, cs_nodes, soft_pdfs,
+            net_cov, order, n_grid, ci_prob, n_quad, mean_prior,
+            method=method,
+        )
+        for i in range(nk)
+    ]
+
+
+def _bme_network_point(
+    ck_node, ch_nodes, zh, cs_nodes, soft_pdfs,
+    net_cov, order, n_grid, ci_prob, n_quad, mean_prior,
+    method="auto",
+):
+    """BME at a single network node."""
+    res = BMEResult(ci_prob=ci_prob)
+    nh = len(ch_nodes)
+    ns = len(cs_nodes)
+    res.n_hard, res.n_soft = nh, ns
+
+    # ── duplicate check ──
+    if nh > 0:
+        dup = np.where(ch_nodes == ck_node)[0]
+        if len(dup) > 0:
+            v = zh[dup[0]]
+            res.mode = res.mean = res.kriging_mean = v
+            res.variance = res.kriging_var = 0.0
+            res.info = "duplicate"
+            return res
+
+    # ── trend removal (simplified for network: constant mean or simple) ──
+    if order is None or (isinstance(order, float) and np.isnan(order)):
+        mk = mean_prior
+        zh_dt = zh - mk
+        sp_dt = [
+            SoftPDF(sp.z_grid - mk, sp.pdf_values.copy(), sp.pdf_type)
+            for sp in soft_pdfs
+        ]
+    else:
+        mk = float(np.mean(zh)) if nh > 0 else mean_prior
+        zh_dt = zh - mk
+        sp_dt = [
+            SoftPDF(sp.z_grid - mk, sp.pdf_values.copy(), sp.pdf_type)
+            for sp in soft_pdfs
+        ]
+
+    # ── covariance blocks ──
+    ck_arr = np.array([ck_node])
+    sig2 = float(net_cov.covariance_block(ck_arr, ck_arr)[0, 0])
+
+    if nh == 0 and ns == 0:
+        return _fill_prior(res, mean_prior, sig2, n_grid, ci_prob)
+
+    if nh > 0:
+        Ckh = net_cov.covariance_block(ck_arr, ch_nodes)          # (1, nh)
+        Chh = net_cov.covariance_block(ch_nodes, ch_nodes)        # (nh, nh)
+        Chh += np.eye(nh) * 1e-10
+        Lhh = linalg.cholesky(Chh, lower=True)
+
+    if ns > 0:
+        Cks = net_cov.covariance_block(ck_arr, cs_nodes)          # (1, ns)
+        Css = net_cov.covariance_block(cs_nodes, cs_nodes)        # (ns, ns)
+        Css += np.eye(ns) * 1e-10
+        if nh > 0:
+            Chs = net_cov.covariance_block(ch_nodes, cs_nodes)    # (nh, ns)
+
+    # ── kriging (hard only) ──
+    if nh > 0:
+        alpha_h = linalg.cho_solve((Lhh, True), zh_dt)
+        k_mu = float((Ckh @ alpha_h).ravel()[0])
+        k_var = max(float((sig2 - Ckh @ linalg.cho_solve((Lhh, True), Ckh.T)).ravel()[0]), 1e-12)
+    else:
+        k_mu, k_var = 0.0, sig2
+    res.kriging_mean = k_mu + mk
+    res.kriging_var = k_var
+
+    if ns == 0:
+        return _fill_gaussian(res, k_mu, k_var, mk, n_grid, ci_prob)
+
+    # ── full BME integration ──
+    nkh = 1 + nh
+    C_kh = np.zeros((nkh, nkh))
+    C_kh[0, 0] = sig2
+    if nh > 0:
+        C_kh[0, 1:] = C_kh[1:, 0] = Ckh.ravel()
+        C_kh[1:, 1:] = Chh
+    C_kh += np.eye(nkh) * 1e-10
+
+    C_s_kh = np.zeros((ns, nkh))
+    C_s_kh[:, 0] = Cks.ravel()
+    if nh > 0:
+        C_s_kh[:, 1:] = Chs.T
+
+    if nh > 0:
+        mu_s_h = (Chs.T @ linalg.cho_solve((Lhh, True), zh_dt)).ravel()
+        K_s_h = Css - Chs.T @ linalg.cho_solve((Lhh, True), Chs)
+    else:
+        mu_s_h = np.zeros(ns)
+        K_s_h = Css.copy()
+    K_s_h = 0.5 * (K_s_h + K_s_h.T) + np.eye(ns) * 1e-10
+    integrate_soft_product(sp_dt, mu_s_h, K_s_h, n_quad)
+
+    L_kh = linalg.cholesky(C_kh, lower=True)
+    K_s_kh = Css - C_s_kh @ linalg.cho_solve((L_kh, True), C_s_kh.T)
+    K_s_kh = 0.5 * (K_s_kh + K_s_kh.T) + np.eye(ns) * 1e-10
+
+    B = C_s_kh @ np.linalg.inv(C_kh)
+    b_k = B[:, 0]
+    b_const = B[:, 1:] @ zh_dt if nh > 0 else np.zeros(ns)
+
+    sigma_k = math.sqrt(k_var)
+    z_lo = k_mu - 5.0 * sigma_k
+    z_hi = k_mu + 5.0 * sigma_k
+    for sp in sp_dt:
+        z_lo = min(z_lo, sp.support[0] - 2 * sigma_k)
+        z_hi = max(z_hi, sp.support[1] + 2 * sigma_k)
+    zg = np.linspace(z_lo, z_hi, n_grid)
+
+    prior = norm.pdf(zg, k_mu, sigma_k)
+    mu_all = np.outer(zg, b_k) + b_const[None, :]
+
+    _method = method
+    if _method == "auto":
+        _method = "laplace" if ns >= 6 else "gauss_hermite"
+    if _method == "laplace":
+        I_num = integrate_soft_laplace_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "ep":
+        I_num = integrate_soft_ep_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "qmc":
+        I_num = integrate_soft_qmc_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "lis":
+        I_num = integrate_soft_lis_batch(sp_dt, mu_all, K_s_kh)
+    else:
+        I_num = integrate_soft_product_batch(sp_dt, mu_all, K_s_kh, n_quad)
+    pdf_raw = prior * I_num
+    pdf_raw[prior < 1e-300] = 0.0
+
+    area = float(_trapz(pdf_raw, zg))
+    if area > 1e-300:
+        pdf_n = pdf_raw / area
+    else:
+        pdf_n = norm.pdf(zg, k_mu, sigma_k)
+        res.info = "integration_fallback"
+
+    zg_final = zg + mk
+
+    res.mode = zg_final[int(np.argmax(pdf_n))]
+    res.mean = float(_trapz(zg_final * pdf_n, zg))
+    res.variance = max(float(_trapz((zg_final - res.mean) ** 2 * pdf_n, zg)), 1e-12)
+    m3 = float(_trapz((zg_final - res.mean) ** 3 * pdf_n, zg))
+    res.skewness = m3 / res.variance ** 1.5 if res.variance > 1e-14 else 0.0
+
+    cdf = np.cumsum(pdf_n) * np.mean(np.diff(zg))
+    cdf /= cdf[-1]
+    al = (1 - ci_prob) / 2
+    res.ci_lower = zg_final[np.clip(np.searchsorted(cdf, al), 0, n_grid - 1)]
+    res.ci_upper = zg_final[np.clip(np.searchsorted(cdf, 1 - al), 0, n_grid - 1)]
+    res.z_grid = zg_final
+    res.pdf = pdf_n
+    if not res.info:
+        res.info = f"full_network_bme nh={nh} ns={ns}"
+    return res
+
+
+# ════════════════════════════════════════════════════════════════
+# NETWORK BME  — space-time
+# ════════════════════════════════════════════════════════════════
+
+def bme_predict_network_st(
+    ck_nodes, tk, ch_nodes, th, zh,
+    cs_nodes=None, ts=None, soft_pdfs=None,
+    net_cov_st=None,
+    nhmax=20, nsmax=8,
+    order=0, n_grid=200, ci_prob=0.95,
+    n_quad=15, mean_prior=0.0,
+    method="auto",
+) -> List[BMEResult]:
+    """Separable space-time BME on a network domain.
+
+    Uses ``NetworkCovarianceST`` for the covariance blocks — separable
+    product of graph-Laplacian spatial covariance and parametric temporal
+    covariance.
+
+    Parameters
+    ----------
+    ck_nodes    : (nk,) estimation node indices.
+    tk          : (nk,) estimation times.
+    ch_nodes    : (nh,) hard-data node indices.
+    th          : (nh,) hard-data times.
+    zh          : (nh,) hard-data values.
+    cs_nodes    : (ns,) soft-data node indices (optional).
+    ts          : (ns,) soft-data times (optional).
+    soft_pdfs   : list[SoftPDF] one per soft point (optional).
+    net_cov_st  : NetworkCovarianceST instance.
+    nhmax, nsmax, order, n_grid, ci_prob, n_quad, mean_prior, method :
+        Same as ``bme_predict_network``.
+
+    Returns
+    -------
+    list[BMEResult]
+    """
+    if net_cov_st is None:
+        raise ValueError("net_cov_st (NetworkCovarianceST) is required.")
+
+    ck_nodes = np.atleast_1d(np.asarray(ck_nodes, dtype=int))
+    tk = np.atleast_1d(np.asarray(tk, dtype=np.float64))
+    ch_nodes = np.atleast_1d(np.asarray(ch_nodes, dtype=int))
+    th = np.atleast_1d(np.asarray(th, dtype=np.float64))
+    zh = np.asarray(zh, dtype=np.float64)
+
+    if cs_nodes is None or soft_pdfs is None:
+        cs_nodes = np.array([], dtype=int)
+        ts = np.array([], dtype=np.float64)
+        soft_pdfs = []
+    else:
+        cs_nodes = np.atleast_1d(np.asarray(cs_nodes, dtype=int))
+        ts = np.atleast_1d(np.asarray(ts, dtype=np.float64))
+
+    nk = len(ck_nodes)
+    return [
+        _bme_network_st_point(
+            ck_nodes[i], tk[i], ch_nodes, th, zh,
+            cs_nodes, ts, soft_pdfs,
+            net_cov_st, order, n_grid, ci_prob, n_quad, mean_prior,
+            method=method,
+        )
+        for i in range(nk)
+    ]
+
+
+def _bme_network_st_point(
+    ck_node, tk_i, ch_nodes, th, zh,
+    cs_nodes, ts, soft_pdfs,
+    net_cov_st, order, n_grid, ci_prob, n_quad, mean_prior,
+    method="auto",
+):
+    """Space-time BME at a single network node + time."""
+    res = BMEResult(ci_prob=ci_prob)
+    nh = len(ch_nodes)
+    ns = len(cs_nodes)
+    res.n_hard, res.n_soft = nh, ns
+
+    ck_arr = np.array([ck_node])
+    tk_arr = np.array([tk_i])
+
+    sig2 = float(net_cov_st(ck_arr, tk_arr, ck_arr, tk_arr)[0, 0])
+
+    if nh == 0 and ns == 0:
+        return _fill_prior(res, mean_prior, sig2, n_grid, ci_prob)
+
+    # ── trend removal ──
+    if order is None or (isinstance(order, float) and np.isnan(order)):
+        mk = mean_prior
+    else:
+        mk = float(np.mean(zh)) if nh > 0 else mean_prior
+    zh_dt = zh - mk
+    sp_dt = [
+        SoftPDF(sp.z_grid - mk, sp.pdf_values.copy(), sp.pdf_type)
+        for sp in soft_pdfs
+    ]
+
+    # ── covariance blocks ──
+    if nh > 0:
+        Ckh = net_cov_st(ck_arr, tk_arr, ch_nodes, th)         # (1, nh)
+        Chh = net_cov_st(ch_nodes, th, ch_nodes, th)            # (nh, nh)
+        Chh += np.eye(nh) * 1e-10
+        Lhh = linalg.cholesky(Chh, lower=True)
+
+    if ns > 0:
+        Cks = net_cov_st(ck_arr, tk_arr, cs_nodes, ts)         # (1, ns)
+        Css = net_cov_st(cs_nodes, ts, cs_nodes, ts)            # (ns, ns)
+        Css += np.eye(ns) * 1e-10
+        if nh > 0:
+            Chs = net_cov_st(ch_nodes, th, cs_nodes, ts)       # (nh, ns)
+
+    # ── kriging ──
+    if nh > 0:
+        k_mu = float((Ckh @ linalg.cho_solve((Lhh, True), zh_dt)).ravel()[0])
+        k_var = max(float((sig2 - Ckh @ linalg.cho_solve((Lhh, True), Ckh.T)).ravel()[0]), 1e-12)
+    else:
+        k_mu, k_var = 0.0, sig2
+    res.kriging_mean, res.kriging_var = k_mu + mk, k_var
+
+    if ns == 0:
+        return _fill_gaussian(res, k_mu, k_var, mk, n_grid, ci_prob)
+
+    # ── full BME ──
+    nkh = 1 + nh
+    C_kh_kh = np.zeros((nkh, nkh))
+    C_kh_kh[0, 0] = sig2
+    if nh > 0:
+        C_kh_kh[0, 1:] = C_kh_kh[1:, 0] = Ckh.ravel()
+        C_kh_kh[1:, 1:] = Chh
+    C_kh_kh += np.eye(nkh) * 1e-10
+
+    C_s_kh = np.zeros((ns, nkh))
+    C_s_kh[:, 0] = Cks.ravel()
+    if nh > 0:
+        C_s_kh[:, 1:] = Chs.T
+
+    if nh > 0:
+        mu_s_h = (Chs.T @ linalg.cho_solve((Lhh, True), zh_dt)).ravel()
+        K_s_h = Css - Chs.T @ linalg.cho_solve((Lhh, True), Chs)
+    else:
+        mu_s_h, K_s_h = np.zeros(ns), Css.copy()
+    K_s_h = 0.5 * (K_s_h + K_s_h.T) + np.eye(ns) * 1e-10
+    integrate_soft_product(sp_dt, mu_s_h, K_s_h, n_quad)
+
+    L_kh = linalg.cholesky(C_kh_kh, lower=True)
+    K_s_kh = Css - C_s_kh @ linalg.cho_solve((L_kh, True), C_s_kh.T)
+    K_s_kh = 0.5 * (K_s_kh + K_s_kh.T) + np.eye(ns) * 1e-10
+
+    B = C_s_kh @ np.linalg.inv(C_kh_kh)
+    b_k = B[:, 0]
+    b_c = B[:, 1:] @ zh_dt if nh > 0 else np.zeros(ns)
+
+    sigma_k = math.sqrt(k_var)
+    z_lo = k_mu - 5 * sigma_k
+    z_hi = k_mu + 5 * sigma_k
+    for sp in sp_dt:
+        z_lo = min(z_lo, sp.support[0] - 2 * sigma_k)
+        z_hi = max(z_hi, sp.support[1] + 2 * sigma_k)
+    zg = np.linspace(z_lo, z_hi, n_grid)
+
+    prior = norm.pdf(zg, k_mu, sigma_k)
+    mu_all = np.outer(zg, b_k) + b_c[None, :]
+
+    _method = method
+    if _method == "auto":
+        _method = "laplace" if ns >= 6 else "gauss_hermite"
+    if _method == "laplace":
+        I_num = integrate_soft_laplace_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "ep":
+        I_num = integrate_soft_ep_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "qmc":
+        I_num = integrate_soft_qmc_batch(sp_dt, mu_all, K_s_kh)
+    elif _method == "lis":
+        I_num = integrate_soft_lis_batch(sp_dt, mu_all, K_s_kh)
+    else:
+        I_num = integrate_soft_product_batch(sp_dt, mu_all, K_s_kh, n_quad)
+    pdf_raw = prior * I_num
+    pdf_raw[prior < 1e-300] = 0.0
+
+    area = float(_trapz(pdf_raw, zg))
+    pdf_n = pdf_raw / area if area > 1e-300 else norm.pdf(zg, k_mu, sigma_k)
+    zg_f = zg + mk
+
+    res.mode = zg_f[int(np.argmax(pdf_n))]
+    res.mean = float(_trapz(zg_f * pdf_n, zg))
+    res.variance = max(float(_trapz((zg_f - res.mean) ** 2 * pdf_n, zg)), 1e-12)
+    m3 = float(_trapz((zg_f - res.mean) ** 3 * pdf_n, zg))
+    res.skewness = m3 / res.variance ** 1.5 if res.variance > 1e-14 else 0.0
+    cdf = np.cumsum(pdf_n) * np.mean(np.diff(zg))
+    cdf /= cdf[-1]
+    al = (1 - ci_prob) / 2
+    res.ci_lower = zg_f[np.clip(np.searchsorted(cdf, al), 0, n_grid - 1)]
+    res.ci_upper = zg_f[np.clip(np.searchsorted(cdf, 1 - al), 0, n_grid - 1)]
+    res.z_grid, res.pdf = zg_f, pdf_n
+    res.info = f"full_network_st_bme nh={nh} ns={ns}"
     return res
 
 

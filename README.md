@@ -12,6 +12,7 @@ A pure-Python implementation of the Bayesian Maximum Entropy (BME) framework for
 * **SPDE / GMRF sparse-precision kriging** — Matérn fields on FEM meshes with O(n^{3/2}) Cholesky; hard-data kriging only (see [limitations](#when-to-use-which-approach)). *(v0.3.0, original contribution)*
 * **Laplace approximation** for soft-data integration within `bme_predict` — O(ns³) per point, replacing exponential-cost GH quadrature when ns is large. *(v0.3.0, original contribution)*
 * **Expectation Propagation (EP)**, **Quasi-Monte Carlo (QMC)**, and **Laplace Importance Sampling (LIS)** — three additional integration methods for diverse soft-data scenarios. *(v0.4.0, original contribution)*
+* **Network-domain BME** via graph-Laplacian covariance — rivers, sewers, pipe networks, road systems.  Supports hard + soft data, all integration methods, and separable space-time.  No Euclidean distance assumption required. *(v0.5.0, original contribution)*
 
 ---
 
@@ -280,6 +281,82 @@ mu, var = spde_kriging(mesh, Q, obs_idx, z_obs, nugget=0.01)
 
 ---
 
+### Network-domain BME *(v0.5.0 — original contribution)*
+
+BME prediction on **network-constrained domains** (rivers, sewers, pipe
+systems, road networks) where Euclidean distance is inappropriate.
+Covariance is derived from the **graph Laplacian** of the network topology,
+guaranteeing a valid (symmetric positive-definite) covariance structure on
+arbitrary graph topologies — trees, cycles, and general networks.
+
+```python
+from pybme import (
+    NetworkCovariance, NetworkCovarianceST,
+    adjacency_from_edges,
+    bme_predict_network, bme_predict_network_st,
+    network_kriging_precision,
+    SoftPDF,
+)
+import numpy as np
+
+# Define a river network: 0—1—2—3—4 with a tributary 2—5—6
+edges = np.array([[0,1],[1,2],[2,3],[3,4],[2,5],[5,6]])
+W = adjacency_from_edges(7, edges)
+
+# Build graph-Laplacian covariance (regularised inverse — Matérn-like on graph)
+net_cov = NetworkCovariance(W, kappa=1.0, sigma2=1.0, from_adjacency=True)
+
+# Hard data at nodes 0, 4, 6
+ch_nodes = np.array([0, 4, 6])
+zh = np.array([2.1, 0.8, 1.5])
+
+# Soft (uncertain) data at node 5
+soft = [SoftPDF.from_gaussian(1.2, 0.3)]
+
+# Full BME at nodes 1, 2, 3
+results = bme_predict_network(
+    ck_nodes=np.array([1, 2, 3]),
+    ch_nodes=ch_nodes, zh=zh,
+    cs_nodes=np.array([5]), soft_pdfs=soft,
+    net_cov=net_cov,
+)
+for i, r in enumerate(results):
+    print(f"Node {[1,2,3][i]}: mean={r.mean:.3f}, var={r.variance:.4f}")
+```
+
+**Separable space-time on a network:**
+
+```python
+# Pair the spatial network covariance with a temporal model
+net_cov_st = NetworkCovarianceST(
+    net_cov, model_t="exponential", params_t=[1.0, 5.0], sigma2=1.0,
+)
+
+# Space-time BME
+results = bme_predict_network_st(
+    ck_nodes=np.array([2]), tk=np.array([3.0]),
+    ch_nodes=np.array([0, 4]), th=np.array([0.0, 1.0]),
+    zh=np.array([2.0, 1.0]),
+    net_cov_st=net_cov_st,
+)
+```
+
+**Precision-based kriging** (hard data only, sparse Cholesky):
+
+```python
+mu, var = network_kriging_precision(net_cov, obs_nodes, z_obs, nugget=0.01)
+```
+
+**Three covariance constructions:**
+
+| Method | Formula | Character |
+|---|---|---|
+| `"regularised"` *(default)* | $C = \sigma^2(\kappa^2 I + L)^{-1}$ | Matérn(ν=1) analog on graph; exponential-like decay |
+| `"diffusion"` | $C = \sigma^2 \exp(-\kappa L)$ | Smoother; Gaussian-like decay |
+| `"precision"` | $Q = \sigma^{-2}(\kappa^2 I + L)$ | Sparse precision matrix for large networks |
+
+---
+
 ### When to use which approach
 
 | Scenario | Recommended approach | Why |
@@ -291,6 +368,9 @@ mu, var = spde_kriging(mesh, Q, obs_idx, z_obs, nugget=0.01)
 | **Unbiased estimate with Laplace speed** | `bme_predict(..., method="lis")` | Laplace Importance Sampling: unbiased correction to Laplace |
 | **Hard data only, any covariance** | `bme_predict()` with no `cs`/`soft_pdfs` | Falls back to standard kriging internally |
 | **Hard data only, Matérn, large 2-D field** | `spde_kriging()` | Sparse Cholesky is O(n^{3/2}) vs O(n³) dense |
+| **Network domain (river, sewer, pipe)** | `bme_predict_network()` | Graph-Laplacian covariance; no Euclidean distance needed |
+| **Network domain, space-time** | `bme_predict_network_st()` | Separable graph-Laplacian × temporal covariance |
+| **Network, hard data only, large graph** | `network_kriging_precision()` | Sparse precision Cholesky on graph Laplacian |
 | **Very high ns or diagnostics** | `bme_predict(..., method="mc")` | Monte Carlo — unbiased but highest variance |
 | **Space-time with soft data** | `bme_predict_st()` | Separable S/T kernel; supports all `method` options |
 
@@ -300,6 +380,9 @@ mu, var = spde_kriging(mesh, Q, obs_idx, z_obs, nugget=0.01)
   soft probabilistic data — it supports all covariance models, trend
   orders, and the full posterior PDF.  The `method` parameter controls
   only *how* the soft-data integral is computed (GH / Laplace / MC).
+* Use **`bme_predict_network()`** / **`bme_predict_network_st()`** for
+  domains where distances are defined by a graph topology (rivers,
+  sewers, roads).  Supports hard + soft data, all integration methods.
 * Use **`spde_kriging()`** when you have a large 2-D spatial field with
   **hard data only**, Matérn covariance, and need the computational
   savings of sparse linear algebra.  It is *not* a replacement for full
@@ -390,7 +473,8 @@ Unlike moment-matching approaches, all six methods can capture the non-Gaussian 
 | Expectation Propagation | — | `method="ep"` in `bme_predict` (v0.4.0) |
 | Quasi-Monte Carlo | — | `method="qmc"` in `bme_predict` (v0.4.0) |
 | Laplace Importance Sampling | — | `method="lis"` in `bme_predict` (v0.4.0) |
-| Space-time | Full S/T framework | Separable S/T |
+| Network-domain BME | — | `bme_predict_network()` / `_st()` via graph Laplacian (v0.5.0) |
+| Space-time | Full S/T framework | Separable S/T (Euclidean and network) |
 | Covariance fitting | Manual | REML auto-fit |
 | Cross-validation | Manual scripting | Built-in `cross_validate()` |
 | Neighbourhood | `neighbours()` | `select_neighbors()` / `_st()` |

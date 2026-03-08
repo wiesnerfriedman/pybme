@@ -68,7 +68,10 @@ from .covariance import (
 )
 
 # prediction
-from .predict import bme_predict, bme_predict_st
+from .predict import (
+    bme_predict, bme_predict_st,
+    bme_predict_network, bme_predict_network_st,
+)
 from .neighborhood import (
     select_neighbors, select_neighbors_st,
     SpatialIndex, SpatialTemporalIndex,
@@ -91,6 +94,15 @@ from .spde import (
     snap_to_mesh,
 )
 
+# Network-domain covariance (graph Laplacian)
+from .network import (
+    NetworkCovariance,
+    NetworkCovarianceST,
+    build_graph_laplacian,
+    adjacency_from_edges,
+    network_kriging_precision,
+)
+
 # fitting & validation
 from .fitting import fit_covariance
 from .validation import cross_validate
@@ -98,7 +110,7 @@ from .validation import cross_validate
 # The original monolithic script is available as pybme.bme_core
 # Tutorials are available as pybme.tutorials.*
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__  = "Corinne Wiesner-Friedman"
 __credits__ = [
     "Corinne Wiesner-Friedman",
@@ -115,6 +127,7 @@ __all__ = [
     "matern_cov", "nugget_cov", "hole_cos_cov", "COV_MODELS",
     # prediction
     "bme_predict", "bme_predict_st",
+    "bme_predict_network", "bme_predict_network_st",
     # neighborhood / trend / integration
     "select_neighbors", "select_neighbors_st",
     "SpatialIndex", "SpatialTemporalIndex",
@@ -127,6 +140,11 @@ __all__ = [
     # SPDE / GMRF
     "SPDEMesh", "matern_to_spde_params", "build_precision_matrix",
     "spde_kriging", "snap_to_mesh",
+    # Network-domain
+    "NetworkCovariance", "NetworkCovarianceST",
+    "build_graph_laplacian", "adjacency_from_edges",
+    "network_kriging_precision",
+    "bme_predict_network", "bme_predict_network_st",
     # fitting / validation
     "fit_covariance", "cross_validate",
 ]
