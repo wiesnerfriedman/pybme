@@ -28,7 +28,7 @@ distinguishing two classes of monitoring stations based on record length:
 
 The fitted covariance model from the companion script is reused:
   C(r) = σ² exp(−3r / a_s) + c₀ δ(r)
-  σ² = 16.17,  a_s = 2.05°,  c₀ ≈ 0
+  σ² = 16.17,  a_s ≈ 200 km,  c₀ ≈ 0
 
 Outputs (figures/):
   fig_soft_A_station_types.png  — map: hard / soft stations, σ_soft colour scale
@@ -93,6 +93,21 @@ n_stations = len(lon)
 valid_mask = ~np.isnan(Z)
 
 # ---------------------------------------------------------------------------
+# 1b. PROJECT LON/LAT TO KILOMETRES
+# ---------------------------------------------------------------------------
+# Equirectangular projection centred on the station centroid — same as the
+# companion covariance-analysis script.  All distances are now in km.
+
+lat_mean_rad = np.radians(lat.mean())
+KM_PER_DEG_LON = np.cos(lat_mean_rad) * 111.32   # ≈ 88 km at ~37.5°N
+KM_PER_DEG_LAT = 111.32
+
+lon_ref = lon.mean()
+lat_ref = lat.mean()
+x_km = (lon - lon_ref) * KM_PER_DEG_LON   # easting  (km)
+y_km = (lat - lat_ref) * KM_PER_DEG_LAT   # northing (km)
+
+# ---------------------------------------------------------------------------
 # 2. COVARIANCE MODEL PARAMETERS (from companion script)
 # ---------------------------------------------------------------------------
 # Fitted separable exponential model:
@@ -101,7 +116,7 @@ valid_mask = ~np.isnan(Z)
 #   C_s(r) = σ² exp(−3r/a_s)   plus nugget c₀ ≈ 0
 
 SILL    = 16.17    # σ²   (µg/m³)²
-RANGE_S = 2.05     # a_s  degrees  (~228 km)
+RANGE_S = 200.0    # a_s  km  (re-fitted with projected coordinates)
 NUGGET  = 0.0      # c₀
 TOTAL_VAR = SILL + NUGGET
 
@@ -175,8 +190,8 @@ soft_pdfs = [
 
 # Hard-data arrays
 zh = Z[hard_idx, yr_idx]
-ch = np.column_stack([lon[hard_idx], lat[hard_idx]])   # (n_hard, 2)
-cs = np.column_stack([lon[soft_idx], lat[soft_idx]])   # (n_soft, 2)
+ch = np.column_stack([x_km[hard_idx], y_km[hard_idx]])   # (n_hard, 2) — km
+cs = np.column_stack([x_km[soft_idx], y_km[soft_idx]])   # (n_soft, 2) — km
 
 # ---------------------------------------------------------------------------
 # 5. BUILD ESTIMATION GRID AND RUN BME
@@ -192,16 +207,20 @@ grid_lon = LON_g.ravel()
 grid_lat = LAT_g.ravel()
 n_grid = len(grid_lon)
 
-# Mask: only estimate where at least one station is within 1.5 × range
-all_sta_lon = np.concatenate([lon[hard_idx], lon[soft_idx]])
-all_sta_lat = np.concatenate([lat[hard_idx], lat[soft_idx]])
+# Project grid to km (same projection as station coordinates)
+grid_x = (grid_lon - lon_ref) * KM_PER_DEG_LON
+grid_y = (grid_lat - lat_ref) * KM_PER_DEG_LAT
+
+# Mask: only estimate where at least one station is within 1.5 × range (km)
+all_sta_x = np.concatenate([x_km[hard_idx], x_km[soft_idx]])
+all_sta_y = np.concatenate([y_km[hard_idx], y_km[soft_idx]])
 dist_to_nearest = np.sqrt(
-    (grid_lon[:, None] - all_sta_lon[None, :]) ** 2 +
-    (grid_lat[:, None] - all_sta_lat[None, :]) ** 2
+    (grid_x[:, None] - all_sta_x[None, :]) ** 2 +
+    (grid_y[:, None] - all_sta_y[None, :]) ** 2
 ).min(axis=1)
 mask_active = dist_to_nearest <= 1.5 * RANGE_S
 
-ck_active = np.column_stack([grid_lon[mask_active], grid_lat[mask_active]])
+ck_active = np.column_stack([grid_x[mask_active], grid_y[mask_active]])
 n_active  = ck_active.shape[0]
 print(f"\nEstimation grid: {n_active} active points out of {n_grid}")
 
@@ -366,28 +385,32 @@ print("Saved fig_soft_D_bme_vs_krige.png")
 # Pick 4 interesting active grid points: near hard stn, near soft stn,
 # between stations, far from all stations.
 
-def nearest_station_dist(glon, glat, slon, slat):
-    return np.sqrt((glon - slon)**2 + (glat - slat)**2).min()
+def nearest_station_dist(gx, gy, sx, sy):
+    return np.sqrt((gx - sx)**2 + (gy - sy)**2).min()
 
 # Candidates among active points
 cands = ck_active
 
 # (i) Near a soft station
-d_soft = np.sqrt((cands[:, 0:1] - lon[soft_idx][None, :]) ** 2 +
-                  (cands[:, 1:2] - lat[soft_idx][None, :]) ** 2).min(axis=1)
+d_soft = np.sqrt((cands[:, 0:1] - x_km[soft_idx][None, :]) ** 2 +
+                  (cands[:, 1:2] - y_km[soft_idx][None, :]) ** 2).min(axis=1)
 pt_near_soft = int(np.argmin(d_soft))
 
 # (ii) Near a hard station
-d_hard = np.sqrt((cands[:, 0:1] - lon[hard_idx][None, :]) ** 2 +
-                  (cands[:, 1:2] - lat[hard_idx][None, :]) ** 2).min(axis=1)
+d_hard = np.sqrt((cands[:, 0:1] - x_km[hard_idx][None, :]) ** 2 +
+                  (cands[:, 1:2] - y_km[hard_idx][None, :]) ** 2).min(axis=1)
 pt_near_hard = int(np.argmin(d_hard))
 
 # (iii) Midpoint between stations — largest minimum distance
 pt_far = int(np.argmax(d_soft + d_hard))
 
 # (iv) Somewhere in the San Joaquin Valley (high concentration area)
-sjv_mask = ((cands[:, 0] > -121.5) & (cands[:, 0] < -119.0) &
-             (cands[:, 1] > 35.5)  & (cands[:, 1] < 37.5))
+sjv_x_min = (-121.5 - lon_ref) * KM_PER_DEG_LON
+sjv_x_max = (-119.0 - lon_ref) * KM_PER_DEG_LON
+sjv_y_min = (35.5 - lat_ref) * KM_PER_DEG_LAT
+sjv_y_max = (37.5 - lat_ref) * KM_PER_DEG_LAT
+sjv_mask = ((cands[:, 0] > sjv_x_min) & (cands[:, 0] < sjv_x_max) &
+             (cands[:, 1] > sjv_y_min)  & (cands[:, 1] < sjv_y_max))
 pt_sjv = int(np.argmax(sjv_mask.astype(float) * bme_mean))
 if not sjv_mask.any():
     pt_sjv = pt_near_hard   # fallback
@@ -421,7 +444,9 @@ for ax, pi, lbl, col in zip(axes_e, point_indices, point_labels, point_colours):
                 color=col, linewidth=2)
         ax.axvline(r.kriging_mean, color="k", linewidth=1.5,
                    label=f"Mean = {r.kriging_mean:.1f}")
-    glon, glat = cands[pi, 0], cands[pi, 1]
+    gx, gy = cands[pi, 0], cands[pi, 1]
+    glon = gx / KM_PER_DEG_LON + lon_ref
+    glat = gy / KM_PER_DEG_LAT + lat_ref
     ax.set_title(f"{lbl}\n({glon:.2f}°, {glat:.2f}°)  nh={r.n_hard}  ns={r.n_soft}",
                  fontsize=9)
     ax.set_xlabel("PM$_{2.5}$ (µg/m³)")
@@ -446,6 +471,7 @@ print(f"Hard data:  {is_hard.sum()} stations (>= {HARD_THRESH} valid yrs)")
 print(f"Soft data:  {is_soft.sum()} stations ({SOFT_THRESH}-{HARD_THRESH-1} valid yrs)")
 print(f"  σ_soft range: {sigma_total.min():.2f} – {sigma_total.max():.2f} µg/m³")
 print(f"  σ_soft mean:  {sigma_total.mean():.2f} µg/m³")
+print(f"  Covariance range: {RANGE_S:.0f} km")
 print()
 print(f"BME posterior mean:     [{np.nanmin(bme_mean):.1f}, {np.nanmax(bme_mean):.1f}] µg/m³")
 print(f"BME posterior std dev:  [{np.nanmin(bme_std_map):.2f}, "

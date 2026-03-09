@@ -150,3 +150,36 @@ def test_ci_coverage():
             inside += 1
     # Expect ≥ 50 % of test points inside the 95 % CI (loose; many are near boundary)
     assert inside >= 4, f"Coverage too low: {inside}/{n_test}"
+
+
+# ── 9. SPD of covariance matrices in BME context ─────────────
+
+def test_bme_data_covariance_spd():
+    """Covariance matrix among all data sites (hard + soft) must be SPD."""
+    from pybme import build_cov_matrix
+    ch, zh = _make_hard_1d(n=20, seed=42)
+    cs = np.array([[14.0], [16.0], [20.0]])
+    all_coords = np.vstack([ch, cs])
+    K = build_cov_matrix(all_coords, all_coords, COV_MODEL, COV_PARAMS)
+    # Symmetric
+    assert_allclose(K, K.T, atol=1e-12)
+    # Positive semi-definite
+    eigvals = np.linalg.eigvalsh(K)
+    assert np.all(eigvals >= -1e-10), \
+        f"BME covariance: min eigenvalue = {eigvals.min():.2e}"
+
+
+def test_bme_kriging_cov_spd():
+    """The hard-hard covariance block used in kriging must be strictly PD.
+
+    bme_predict internally builds K = C(ch, ch) and solves it via Cholesky.
+    """
+    from pybme import build_cov_matrix
+    rng = np.random.default_rng(55)
+    ch = rng.uniform(0, 30, (25, 2))
+    K = build_cov_matrix(ch, ch, COV_MODEL, COV_PARAMS)
+    eigvals = np.linalg.eigvalsh(K)
+    assert np.all(eigvals > 0), \
+        f"Kriging cov not strictly PD: min eigenvalue = {eigvals.min():.2e}"
+    # Cholesky should succeed on a PD matrix
+    np.linalg.cholesky(K)

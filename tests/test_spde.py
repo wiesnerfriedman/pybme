@@ -118,6 +118,30 @@ class TestPrecisionMatrix:
         # They should differ
         assert abs(Q1 - Q2).max() > 1e-6
 
+    def test_precision_spd_alpha2(self):
+        """Precision matrix with α=2 (Matérn ν=1.5) must be SPD."""
+        mesh = _make_grid_mesh(8, 8)
+        kappa, tau = matern_to_spde_params(1.0, 2.0, 1.5)
+        Q = build_precision_matrix(mesh, kappa, tau, alpha=2)
+        assert sparse.issparse(Q)
+        diff = Q - Q.T
+        assert abs(diff).max() < 1e-10
+        ev = sparse.linalg.eigsh(Q.tocsc(), k=1, which='SM',
+                                  return_eigenvectors=False)
+        assert ev[0] > -1e-8, "Q (α=2) has negative eigenvalue"
+
+    def test_covariance_from_precision_spd(self):
+        """Dense inverse of Q (the implied covariance) should be SPD."""
+        mesh = _make_grid_mesh(6, 6)
+        kappa, tau = matern_to_spde_params(1.0, 2.0, 0.5)
+        Q = build_precision_matrix(mesh, kappa, tau, alpha=1)
+        Q_dense = Q.toarray()
+        C = np.linalg.inv(Q_dense)
+        assert_allclose(C, C.T, atol=1e-10)
+        eigvals = np.linalg.eigvalsh(C)
+        assert np.all(eigvals > -1e-10), \
+            f"Implied covariance: min eigenvalue = {eigvals.min():.2e}"
+
 
 # ── §4 spde_kriging ─────────────────────────────────────────
 

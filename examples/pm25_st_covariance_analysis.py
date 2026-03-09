@@ -6,7 +6,9 @@ Space–Time Covariance Analysis of PM2.5 across California (1997–2016)
 This script:
 1. Loads the annual-average PM2.5 data (115 monitoring stations, 20 years).
 2. Treats -9999 values as missing (NaN).
-3. Estimates the spatial and temporal covariance margins SEPARATELY:
+3. Projects geographic coordinates (lon/lat) to kilometres using an
+   equirectangular approximation centred on the station centroid.
+4. Estimates the spatial and temporal covariance margins SEPARATELY:
    • Spatial margin Ĉ_s(r): subtract each year's cross-station mean,
      compute station-pair products binned by distance, average over years.
    • Temporal margin Ĉ_t(τ): subtract each station's across-year mean,
@@ -14,9 +16,9 @@ This script:
    This removes the large temporal trend from the spatial margin and
    the spatial pattern from the temporal margin, yielding physically
    sensible (non-negative) experimental covariance curves.
-4. Fits a separable exponential + nugget model to both margins jointly
+5. Fits a separable exponential + nugget model to both margins jointly
    via weighted least squares.
-5. Produces six publication-quality figures.
+6. Produces publication-quality figures including kriging maps.
 
 Requirements: numpy, scipy, matplotlib  (all in the project venv)
 """
@@ -83,6 +85,27 @@ print(f"Loaded {n_stations} stations × {n_years} years "
       f"({n_obs}/{n_total} valid, {100*n_obs/n_total:.1f}%)")
 
 # ---------------------------------------------------------------------------
+# 1b. PROJECT LON/LAT TO KILOMETRES
+# ---------------------------------------------------------------------------
+# Distances in degrees of longitude/latitude are not Euclidean on the
+# Earth's surface because 1° longitude shrinks with latitude:
+#   Δx_km = Δlon · cos(φ) · 111.32 km/°
+# We use an equirectangular projection centred on the station centroid.
+# For California's ~10° latitudinal extent this is accurate to ~1–2 %.
+
+lat_mean_rad = np.radians(lat.mean())
+KM_PER_DEG_LON = np.cos(lat_mean_rad) * 111.32   # ≈ 88 km at ~37.5°N
+KM_PER_DEG_LAT = 111.32
+
+lon_ref = lon.mean()   # reference origin (station centroid)
+lat_ref = lat.mean()
+x_km = (lon - lon_ref) * KM_PER_DEG_LON   # easting  (km)
+y_km = (lat - lat_ref) * KM_PER_DEG_LAT   # northing (km)
+
+print(f"Projection: equirectangular centred at ({lon_ref:.2f}°, {lat_ref:.2f}°)")
+print(f"  Scale: 1° lon ≈ {KM_PER_DEG_LON:.1f} km,  1° lat ≈ {KM_PER_DEG_LAT:.1f} km")
+
+# ---------------------------------------------------------------------------
 # 2. DESCRIPTIVE STATISTICS
 # ---------------------------------------------------------------------------
 overall_mean = np.nanmean(Z)
@@ -121,12 +144,12 @@ Z_spatial[~valid_mask] = np.nan
 Z_temporal = Z - station_means[:, None]      # shape (n_stations, n_years)
 Z_temporal[~valid_mask] = np.nan
 
-# Pre-compute pairwise station distances
-dist_matrix = np.sqrt((lon[:, None] - lon[None, :]) ** 2 +
-                       (lat[:, None] - lat[None, :]) ** 2)
+# Pre-compute pairwise station distances (km, projected coordinates)
+dist_matrix = np.sqrt((x_km[:, None] - x_km[None, :]) ** 2 +
+                       (y_km[:, None] - y_km[None, :]) ** 2)
 
 # ── 3a. Experimental SPATIAL covariance ────────────────────────────────────
-max_spatial  = 8.0    # degrees (~890 km)
+max_spatial  = 900.0    # km
 n_sbins      = 16
 spatial_bin_edges   = np.linspace(0, max_spatial, n_sbins + 1)
 spatial_bin_centres = 0.5 * (spatial_bin_edges[:-1] + spatial_bin_edges[1:])
@@ -248,7 +271,7 @@ def objective(log_params):
 
 # Initial guesses from the data
 var0 = max(exp_cov_spatial[0], exp_cov_temporal[0])
-x0 = np.log([var0 * 0.8, 2.0, 3.0, var0 * 0.1])
+x0 = np.log([var0 * 0.8, 200.0, 3.0, var0 * 0.1])
 result = minimize(objective, x0, method="Nelder-Mead",
                   options={"maxiter": 50_000, "xatol": 1e-10, "fatol": 1e-10})
 
@@ -256,7 +279,7 @@ sill_fit, range_s_fit, range_t_fit, nugget_fit = np.exp(result.x)
 
 print(f"\nFitted covariance model parameters:")
 print(f"  σ²  (sill)           = {sill_fit:.4f}")
-print(f"  a_s (spatial range)  = {range_s_fit:.4f} deg  ≈ {range_s_fit*111:.0f} km")
+print(f"  a_s (spatial range)  = {range_s_fit:.1f} km")
 print(f"  a_t (temporal range) = {range_t_fit:.4f} yr")
 print(f"  c₀  (nugget)         = {nugget_fit:.4f}")
 print(f"  Total sill (σ² + c₀) = {sill_fit + nugget_fit:.4f}")
@@ -306,7 +329,7 @@ C_model_s = model_spatial(r_fine, sill_fit, range_s_fit, nugget_fit)
 ax3.plot(r_fine, C_model_s, "r-", linewidth=2, label="Model")
 ax3.axhline(sill_fit + nugget_fit, color="gray", linestyle="--", linewidth=0.8,
             label=f"Sill ($\\sigma^2$+$c_0$) = {sill_fit+nugget_fit:.2f}")
-ax3.set_xlabel("Spatial lag r (degrees)")
+ax3.set_xlabel("Spatial lag r (km)")
 ax3.set_ylabel("Covariance $\\hat{C}_s(r)$")
 ax3.set_title("Marginal Spatial Covariance")
 ax3.legend()
@@ -342,7 +365,7 @@ C_model_2d = model_cov(R_mesh, T_mesh, sill_fit, range_s_fit,
                         range_t_fit, nugget_fit)
 im = ax5.pcolormesh(R_mesh, T_mesh, C_model_2d,
                      cmap="viridis", shading="auto")
-ax5.set_xlabel("Spatial lag r (degrees)")
+ax5.set_xlabel("Spatial lag r (km)")
 ax5.set_ylabel("Temporal lag τ (years)")
 ax5.set_title("Fitted Space-Time Covariance Model — PM$_{2.5}$ California")
 plt.colorbar(im, ax=ax5, label="C(r, τ)")
@@ -357,7 +380,7 @@ fig6, (ax6a, ax6b) = plt.subplots(1, 2, figsize=(12, 4.5))
 ax6a.plot(spatial_bin_centres, exp_cov_spatial, "ks", markersize=7,
           label="Experimental", zorder=3)
 ax6a.plot(r_fine, C_model_s, "r-", linewidth=2, label="Fitted model")
-ax6a.set_xlabel("Spatial lag r (degrees)")
+ax6a.set_xlabel("Spatial lag r (km)")
 ax6a.set_ylabel("$\\hat{C}_s(r)$")
 ax6a.set_title("(a) Spatial Covariance Margin")
 ax6a.legend(fontsize=9)
@@ -395,7 +418,7 @@ print("Saved fig6_model_vs_experimental.png")
 # First moment  = ẑ(x₀)               [kriging mean estimate]
 # Second moment = σ²(x₀) = C(0,0) − k(x₀)ᵀ λ   [kriging variance]
 #
-# Grid points farther than 1.5 × range_s (~340 km) from every station
+# Grid points farther than 1.5 × range_s from every station
 # are masked out, naturally hiding ocean/Nevada/Arizona regions.
 
 # ── 6a. Build estimation grid ─────────────────────────────────────────────
@@ -411,9 +434,13 @@ grid_lon = LON_g.ravel()
 grid_lat = LAT_g.ravel()
 n_grid = len(grid_lon)
 
-# Distance from every grid point to the nearest station
-dist_grid_sta = np.sqrt((grid_lon[:, None] - lon[None, :]) ** 2 +
-                         (grid_lat[:, None] - lat[None, :]) ** 2)   # (n_grid, n_sta)
+# Project grid to km (same projection as station coordinates)
+grid_x = (grid_lon - lon_ref) * KM_PER_DEG_LON
+grid_y = (grid_lat - lat_ref) * KM_PER_DEG_LAT
+
+# Distance from every grid point to the nearest station (km)
+dist_grid_sta = np.sqrt((grid_x[:, None] - x_km[None, :]) ** 2 +
+                         (grid_y[:, None] - y_km[None, :]) ** 2)   # (n_grid, n_sta)
 nearest_dist  = dist_grid_sta.min(axis=1)
 mask_ca = nearest_dist <= 1.5 * range_s_fit    # keep only "data-rich" zone
 
@@ -546,7 +573,7 @@ print()
 print("Fitted separable covariance model:")
 print("  C(r,τ) = σ² · exp(−3r/a_s) · exp(−3τ/a_t) + c₀·δ(r,τ)")
 print(f"  σ²  = {sill_fit:.4f}  (sill)")
-print(f"  a_s = {range_s_fit:.4f} deg  ≈ {range_s_fit*111:.0f} km  (spatial range)")
+print(f"  a_s = {range_s_fit:.1f} km  (spatial range)")
 print(f"  a_t = {range_t_fit:.4f} yr  (temporal range)")
 print(f"  c₀  = {nugget_fit:.4f}  (nugget)")
 print(f"  Total variance at origin = σ²+c₀ = {sill_fit+nugget_fit:.4f}")

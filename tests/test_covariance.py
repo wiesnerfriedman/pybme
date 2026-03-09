@@ -103,6 +103,72 @@ def test_cov_matrix_spd():
     assert np.all(eigvals >= -1e-10), f"Negative eigenvalue: {eigvals.min()}"
 
 
+# ── 5b. SPD for all models with various point configurations ─
+
+_SPD_CONFIGS = [
+    # (model_name, params, n_points, n_dims, seed)
+    ("exponential", [1.0, 5.0],  20, 1, 10),
+    ("exponential", [2.0, 3.0],  40, 2, 11),
+    ("exponential", [1.5, 8.0],  30, 3, 12),
+    ("gaussian",    [2.0, 5.0],  20, 1, 13),
+    ("gaussian",    [3.0, 8.0],  25, 2, 14),
+    ("spherical",   [1.0, 10.0], 20, 1, 15),
+    ("spherical",   [2.5, 6.0],  25, 2, 16),
+    ("matern",      [1.0, 5.0, 0.5], 20, 2, 17),
+    ("matern",      [2.0, 8.0, 1.5], 25, 2, 18),
+    ("matern",      [1.5, 4.0, 2.5], 30, 2, 19),
+    ("nugget",      [3.0],       15, 2, 20),
+    # NOTE: hole_cos is intentionally excluded — the cosine / hole-effect
+    # model is not guaranteed positive-definite in 2-D or 3-D.
+]
+
+
+@pytest.mark.parametrize(
+    "name,params,n,ndim,seed", _SPD_CONFIGS,
+    ids=[f"{c[0]}_{c[2]}pts_{c[3]}d" for c in _SPD_CONFIGS],
+)
+def test_cov_matrix_spd_all_models(name, params, n, ndim, seed):
+    """Covariance matrix must be SPD for every standard model."""
+    rng = np.random.default_rng(seed)
+    coords = rng.uniform(0, 20, (n, ndim))
+    K = build_cov_matrix(coords, coords, name, params)
+    # Symmetric
+    assert_allclose(K, K.T, atol=1e-12)
+    # Positive semi-definite: all eigenvalues ≥ 0
+    eigvals = np.linalg.eigvalsh(K)
+    assert np.all(eigvals >= -1e-10), \
+        f"{name}: min eigenvalue = {eigvals.min():.2e} (n={n}, ndim={ndim})"
+
+
+def test_cov_matrix_spd_nested():
+    """Nested (additive) covariance matrix must be SPD."""
+    rng = np.random.default_rng(99)
+    coords = rng.uniform(0, 15, (30, 2))
+    K = build_cov_matrix(
+        coords, coords,
+        ["nugget", "exponential", "gaussian"],
+        [[0.5], [1.0, 8.0], [0.8, 5.0]],
+    )
+    assert_allclose(K, K.T, atol=1e-12)
+    eigvals = np.linalg.eigvalsh(K)
+    assert np.all(eigvals >= -1e-10), \
+        f"Nested model: min eigenvalue = {eigvals.min():.2e}"
+
+
+def test_cov_matrix_spd_large():
+    """SPD check with a larger matrix (n=100)."""
+    rng = np.random.default_rng(77)
+    coords = rng.uniform(0, 50, (100, 2))
+    K = build_cov_matrix(coords, coords, "exponential", [1.0, 10.0])
+    assert_allclose(K, K.T, atol=1e-12)
+    eigvals = np.linalg.eigvalsh(K)
+    assert np.all(eigvals >= -1e-10), \
+        f"Large matrix: min eigenvalue = {eigvals.min():.2e}"
+    # Condition number should not be astronomical
+    cond = eigvals.max() / max(eigvals.min(), 1e-15)
+    assert cond < 1e14, f"Condition number too large: {cond:.2e}"
+
+
 # ── 6. Distance matrix ───────────────────────────────────────
 
 def test_coord2dist_basic():

@@ -74,3 +74,22 @@ def test_integration_with_near_singular_cov():
     cov = np.array([[1e-14]])  # nearly 0
     I = integrate_soft_product([sp], mu, cov)
     assert np.isfinite(I) and I > 0
+
+
+# ── 6. SPD covariance in multi-dimensional integration ───────
+
+def test_multivariate_cov_spd_integration():
+    """Verify integration works correctly with a verified-SPD 3×3 covariance."""
+    cov = np.array([[1.0, 0.5, 0.2],
+                    [0.5, 1.0, 0.4],
+                    [0.2, 0.4, 1.0]])
+    # Confirm SPD before integration
+    eigvals = np.linalg.eigvalsh(cov)
+    assert np.all(eigvals > 0), "Test covariance should be PD"
+
+    sp1 = SoftPDF.from_gaussian(0, 1, n_pts=30)
+    sp2 = SoftPDF.from_gaussian(0, 1, n_pts=30)
+    sp3 = SoftPDF.from_gaussian(0, 1, n_pts=30)
+    mu = np.zeros(3)
+    I = integrate_soft_product([sp1, sp2, sp3], mu, cov)
+    assert np.isfinite(I) and I > 0
