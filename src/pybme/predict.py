@@ -249,7 +249,6 @@ def _bme_point(ck, ch, zh, cs, soft_pdfs,
         mu_s_h = np.zeros(ns)
         K_s_h = Css.copy()
     K_s_h = 0.5 * (K_s_h + K_s_h.T) + np.eye(ns) * 1e-10
-    I_den = integrate_soft_product(sp_dt, mu_s_h, K_s_h, n_quad)
 
     # Numerator integral:  E [ ∏ fS | z_k, z_h ]  — varies with z_k
     L_kh = linalg.cholesky(C_kh, lower=True)
@@ -290,11 +289,8 @@ def _bme_point(ck, ch, zh, cs, soft_pdfs,
     pdf_raw = prior * I_num
     pdf_raw[prior < 1e-300] = 0.0
 
-    area = float(_trapz(pdf_raw, zg))
-    if area > 1e-300:
-        pdf_n = pdf_raw / area
-    else:
-        pdf_n = norm.pdf(zg, k_mu, sigma_k)
+    pdf_n = _normalise_posterior_pdf(pdf_raw, zg, k_mu, sigma_k)
+    if not np.isfinite(float(_trapz(pdf_raw, zg))) or float(_trapz(pdf_raw, zg)) <= 1e-300:
         res.info = "integration_fallback"
 
     zg_final = zg + mk
@@ -306,8 +302,7 @@ def _bme_point(ck, ch, zh, cs, soft_pdfs,
     m3 = float(_trapz((zg_final - res.mean) ** 3 * pdf_n, zg))
     res.skewness = m3 / res.variance ** 1.5 if res.variance > 1e-14 else 0.0
 
-    cdf = np.cumsum(pdf_n) * np.mean(np.diff(zg))
-    cdf /= cdf[-1]
+    cdf = _posterior_cdf(pdf_n, zg)
     al = (1 - ci_prob) / 2
     res.ci_lower = zg_final[np.clip(np.searchsorted(cdf, al), 0, n_grid - 1)]
     res.ci_upper = zg_final[np.clip(np.searchsorted(cdf, 1 - al), 0, n_grid - 1)]
@@ -474,7 +469,6 @@ def _bme_st_point(ck_i, tk_i, ch, th, zh, cs, ts, soft_pdfs,
     else:
         mu_s_h, K_s_h = np.zeros(ns), Css.copy()
     K_s_h = 0.5 * (K_s_h + K_s_h.T) + np.eye(ns) * 1e-10
-    integrate_soft_product(sp_dt, mu_s_h, K_s_h, n_quad)  # denominator
 
     L_kh = linalg.cholesky(C_kh_kh, lower=True)
     K_s_kh = Css - C_s_kh @ linalg.cho_solve((L_kh, True), C_s_kh.T)
@@ -513,8 +507,7 @@ def _bme_st_point(ck_i, tk_i, ch, th, zh, cs, ts, soft_pdfs,
     pdf_raw = prior * I_num
     pdf_raw[prior < 1e-300] = 0.0
 
-    area = float(_trapz(pdf_raw, zg))
-    pdf_n = pdf_raw / area if area > 1e-300 else norm.pdf(zg, k_mu, sigma_k)
+    pdf_n = _normalise_posterior_pdf(pdf_raw, zg, k_mu, sigma_k)
     zg_f = zg + mk
 
     res.mode = zg_f[int(np.argmax(pdf_n))]
@@ -522,8 +515,7 @@ def _bme_st_point(ck_i, tk_i, ch, th, zh, cs, ts, soft_pdfs,
     res.variance = max(float(_trapz((zg_f - res.mean) ** 2 * pdf_n, zg)), 1e-12)
     m3 = float(_trapz((zg_f - res.mean) ** 3 * pdf_n, zg))
     res.skewness = m3 / res.variance ** 1.5 if res.variance > 1e-14 else 0.0
-    cdf = np.cumsum(pdf_n) * np.mean(np.diff(zg))
-    cdf /= cdf[-1]
+    cdf = _posterior_cdf(pdf_n, zg)
     al = (1 - ci_prob) / 2
     res.ci_lower = zg_f[np.clip(np.searchsorted(cdf, al), 0, n_grid - 1)]
     res.ci_upper = zg_f[np.clip(np.searchsorted(cdf, 1 - al), 0, n_grid - 1)]
@@ -593,14 +585,35 @@ def bme_predict_network(
         cs_nodes = np.atleast_1d(np.asarray(cs_nodes, dtype=int))
 
     nk = len(ck_nodes)
-    return [
-        _bme_network_point(
-            ck_nodes[i], ch_nodes, zh, cs_nodes, soft_pdfs,
+    nh_all = len(ch_nodes)
+    ns_all = len(cs_nodes)
+    results = []
+    for i in range(nk):
+        ck_i = ck_nodes[i]
+        ck_arr = np.array([ck_i])
+
+        # --- neighbourhood selection via covariance magnitude ---
+        if nh_all > nhmax:
+            cov_h = np.abs(net_cov.covariance_block(ck_arr, ch_nodes).ravel())
+            idx_h = np.argsort(-cov_h)[:nhmax]
+            ch_sel, zh_sel = ch_nodes[idx_h], zh[idx_h]
+        else:
+            ch_sel, zh_sel = ch_nodes, zh
+
+        if ns_all > nsmax:
+            cov_s = np.abs(net_cov.covariance_block(ck_arr, cs_nodes).ravel())
+            idx_s = np.argsort(-cov_s)[:nsmax]
+            cs_sel = cs_nodes[idx_s]
+            sp_sel = [soft_pdfs[j] for j in idx_s]
+        else:
+            cs_sel, sp_sel = cs_nodes, soft_pdfs
+
+        results.append(_bme_network_point(
+            ck_i, ch_sel, zh_sel, cs_sel, sp_sel,
             net_cov, order, n_grid, ci_prob, n_quad, mean_prior,
             method=method,
-        )
-        for i in range(nk)
-    ]
+        ))
+    return results
 
 
 def _bme_network_point(
@@ -628,17 +641,11 @@ def _bme_network_point(
     if order is None or (isinstance(order, float) and np.isnan(order)):
         mk = mean_prior
         zh_dt = zh - mk
-        sp_dt = [
-            SoftPDF(sp.z_grid - mk, sp.pdf_values.copy(), sp.pdf_type)
-            for sp in soft_pdfs
-        ]
+        sp_dt = [sp.shifted(mk) for sp in soft_pdfs]
     else:
         mk = float(np.mean(zh)) if nh > 0 else mean_prior
         zh_dt = zh - mk
-        sp_dt = [
-            SoftPDF(sp.z_grid - mk, sp.pdf_values.copy(), sp.pdf_type)
-            for sp in soft_pdfs
-        ]
+        sp_dt = [sp.shifted(mk) for sp in soft_pdfs]
 
     # ── covariance blocks ──
     ck_arr = np.array([ck_node])
@@ -694,13 +701,12 @@ def _bme_network_point(
         mu_s_h = np.zeros(ns)
         K_s_h = Css.copy()
     K_s_h = 0.5 * (K_s_h + K_s_h.T) + np.eye(ns) * 1e-10
-    integrate_soft_product(sp_dt, mu_s_h, K_s_h, n_quad)
 
     L_kh = linalg.cholesky(C_kh, lower=True)
     K_s_kh = Css - C_s_kh @ linalg.cho_solve((L_kh, True), C_s_kh.T)
     K_s_kh = 0.5 * (K_s_kh + K_s_kh.T) + np.eye(ns) * 1e-10
 
-    B = C_s_kh @ np.linalg.inv(C_kh)
+    B = linalg.cho_solve((L_kh, True), C_s_kh.T).T
     b_k = B[:, 0]
     b_const = B[:, 1:] @ zh_dt if nh > 0 else np.zeros(ns)
 
@@ -731,11 +737,8 @@ def _bme_network_point(
     pdf_raw = prior * I_num
     pdf_raw[prior < 1e-300] = 0.0
 
-    area = float(_trapz(pdf_raw, zg))
-    if area > 1e-300:
-        pdf_n = pdf_raw / area
-    else:
-        pdf_n = norm.pdf(zg, k_mu, sigma_k)
+    pdf_n = _normalise_posterior_pdf(pdf_raw, zg, k_mu, sigma_k)
+    if not np.isfinite(float(_trapz(pdf_raw, zg))) or float(_trapz(pdf_raw, zg)) <= 1e-300:
         res.info = "integration_fallback"
 
     zg_final = zg + mk
@@ -746,8 +749,7 @@ def _bme_network_point(
     m3 = float(_trapz((zg_final - res.mean) ** 3 * pdf_n, zg))
     res.skewness = m3 / res.variance ** 1.5 if res.variance > 1e-14 else 0.0
 
-    cdf = np.cumsum(pdf_n) * np.mean(np.diff(zg))
-    cdf /= cdf[-1]
+    cdf = _posterior_cdf(pdf_n, zg)
     al = (1 - ci_prob) / 2
     res.ci_lower = zg_final[np.clip(np.searchsorted(cdf, al), 0, n_grid - 1)]
     res.ci_upper = zg_final[np.clip(np.searchsorted(cdf, 1 - al), 0, n_grid - 1)]
@@ -770,6 +772,7 @@ def bme_predict_network_st(
     order=0, n_grid=200, ci_prob=0.95,
     n_quad=15, mean_prior=0.0,
     method="auto",
+    n_jobs=1,
 ) -> List[BMEResult]:
     """Separable space-time BME on a network domain.
 
@@ -790,6 +793,8 @@ def bme_predict_network_st(
     net_cov_st  : NetworkCovarianceST instance.
     nhmax, nsmax, order, n_grid, ci_prob, n_quad, mean_prior, method :
         Same as ``bme_predict_network``.
+    n_jobs      : number of parallel workers (1 = serial; -1 = all CPUs).
+                  Requires ``concurrent.futures`` (stdlib) or ``joblib``.
 
     Returns
     -------
@@ -813,15 +818,68 @@ def bme_predict_network_st(
         ts = np.atleast_1d(np.asarray(ts, dtype=np.float64))
 
     nk = len(ck_nodes)
-    return [
-        _bme_network_st_point(
-            ck_nodes[i], tk[i], ch_nodes, th, zh,
-            cs_nodes, ts, soft_pdfs,
+    nh_all = len(ch_nodes)
+    ns_all = len(cs_nodes)
+
+    def _worker(i):
+        """Process a single prediction point (neighbourhood + BME)."""
+        ck_i = ck_nodes[i]
+        tk_i = tk[i]
+        ck_arr = np.array([ck_i])
+        tk_arr = np.array([tk_i])
+
+        # --- neighbourhood selection via covariance magnitude ---
+        if nh_all > nhmax:
+            cov_h = np.abs(net_cov_st(ck_arr, tk_arr, ch_nodes, th).ravel())
+            idx_h = np.argsort(-cov_h)[:nhmax]
+            ch_sel, th_sel, zh_sel = ch_nodes[idx_h], th[idx_h], zh[idx_h]
+        else:
+            ch_sel, th_sel, zh_sel = ch_nodes, th, zh
+
+        if ns_all > nsmax:
+            cov_s = np.abs(net_cov_st(ck_arr, tk_arr, cs_nodes, ts).ravel())
+            idx_s = np.argsort(-cov_s)[:nsmax]
+            cs_sel = cs_nodes[idx_s]
+            ts_sel = ts[idx_s]
+            sp_sel = [soft_pdfs[j] for j in idx_s]
+        else:
+            cs_sel, ts_sel, sp_sel = cs_nodes, ts, soft_pdfs
+
+        return _bme_network_st_point(
+            ck_i, tk_i, ch_sel, th_sel, zh_sel,
+            cs_sel, ts_sel, sp_sel,
             net_cov_st, order, n_grid, ci_prob, n_quad, mean_prior,
             method=method,
         )
-        for i in range(nk)
-    ]
+
+    # ── parallel dispatch ───────────────────────────────────────
+    if n_jobs != 1 and nk > 4:
+        import os
+        n_workers = os.cpu_count() if n_jobs == -1 else n_jobs
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+            import sys as _sys
+            print(f"    BME ST: dispatching {nk} points to {n_workers} workers ...",
+                  file=_sys.stderr, flush=True)
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                results = list(pool.map(_worker, range(nk), chunksize=max(1, nk // (n_workers * 4))))
+            print(f"\r    BME ST: {nk}/{nk} (100%)    ", file=_sys.stderr)
+            return results
+        except Exception:
+            pass  # fall back to serial loop
+
+    # ── serial loop with progress ───────────────────────────────
+    _log_interval = max(1, nk // 10)
+    results = []
+    for i in range(nk):
+        if i % _log_interval == 0 and nk > 20:
+            import sys as _sys
+            print(f"\r    BME ST: {i}/{nk} ({100*i//nk}%) ...", end="", flush=True, file=_sys.stderr)
+        results.append(_worker(i))
+    if nk > 20:
+        import sys as _sys
+        print(f"\r    BME ST: {nk}/{nk} (100%)    ", file=_sys.stderr)
+    return results
 
 
 def _bme_network_st_point(
@@ -850,10 +908,7 @@ def _bme_network_st_point(
     else:
         mk = float(np.mean(zh)) if nh > 0 else mean_prior
     zh_dt = zh - mk
-    sp_dt = [
-        SoftPDF(sp.z_grid - mk, sp.pdf_values.copy(), sp.pdf_type)
-        for sp in soft_pdfs
-    ]
+    sp_dt = [sp.shifted(mk) for sp in soft_pdfs]
 
     # ── covariance blocks ──
     if nh > 0:
@@ -900,13 +955,12 @@ def _bme_network_st_point(
     else:
         mu_s_h, K_s_h = np.zeros(ns), Css.copy()
     K_s_h = 0.5 * (K_s_h + K_s_h.T) + np.eye(ns) * 1e-10
-    integrate_soft_product(sp_dt, mu_s_h, K_s_h, n_quad)
 
     L_kh = linalg.cholesky(C_kh_kh, lower=True)
     K_s_kh = Css - C_s_kh @ linalg.cho_solve((L_kh, True), C_s_kh.T)
     K_s_kh = 0.5 * (K_s_kh + K_s_kh.T) + np.eye(ns) * 1e-10
 
-    B = C_s_kh @ np.linalg.inv(C_kh_kh)
+    B = linalg.cho_solve((L_kh, True), C_s_kh.T).T
     b_k = B[:, 0]
     b_c = B[:, 1:] @ zh_dt if nh > 0 else np.zeros(ns)
 
@@ -937,8 +991,7 @@ def _bme_network_st_point(
     pdf_raw = prior * I_num
     pdf_raw[prior < 1e-300] = 0.0
 
-    area = float(_trapz(pdf_raw, zg))
-    pdf_n = pdf_raw / area if area > 1e-300 else norm.pdf(zg, k_mu, sigma_k)
+    pdf_n = _normalise_posterior_pdf(pdf_raw, zg, k_mu, sigma_k)
     zg_f = zg + mk
 
     res.mode = zg_f[int(np.argmax(pdf_n))]
@@ -946,8 +999,7 @@ def _bme_network_st_point(
     res.variance = max(float(_trapz((zg_f - res.mean) ** 2 * pdf_n, zg)), 1e-12)
     m3 = float(_trapz((zg_f - res.mean) ** 3 * pdf_n, zg))
     res.skewness = m3 / res.variance ** 1.5 if res.variance > 1e-14 else 0.0
-    cdf = np.cumsum(pdf_n) * np.mean(np.diff(zg))
-    cdf /= cdf[-1]
+    cdf = _posterior_cdf(pdf_n, zg)
     al = (1 - ci_prob) / 2
     res.ci_lower = zg_f[np.clip(np.searchsorted(cdf, al), 0, n_grid - 1)]
     res.ci_upper = zg_f[np.clip(np.searchsorted(cdf, 1 - al), 0, n_grid - 1)]
@@ -968,6 +1020,40 @@ def _fill_prior(res, mk, sig2, n_grid, ci_prob):
     res.ci_lower, res.ci_upper = mk - zc * sig, mk + zc * sig
     res.info = "no_data"
     return res
+
+
+def _normalise_posterior_pdf(pdf_raw, zg, mean, sigma):
+    """Return a finite, unit-area posterior PDF on ``zg``."""
+    pdf_n = np.asarray(pdf_raw, dtype=np.float64)
+    pdf_n = np.where(np.isfinite(pdf_n) & (pdf_n >= 0.0), pdf_n, 0.0)
+
+    area = float(_trapz(pdf_n, zg))
+    if not (area > 1e-300 and np.isfinite(area)):
+        pdf_n = norm.pdf(zg, mean, sigma)
+        pdf_n = np.where(np.isfinite(pdf_n) & (pdf_n >= 0.0), pdf_n, 0.0)
+        area = float(_trapz(pdf_n, zg))
+
+    if not (area > 1e-300 and np.isfinite(area)):
+        pdf_n = np.zeros_like(zg, dtype=np.float64)
+        pdf_n[np.argmin(np.abs(zg - mean))] = 1.0 / max(float(np.mean(np.diff(zg))), 1e-12)
+        area = float(_trapz(pdf_n, zg))
+
+    return pdf_n / max(area, 1e-300)
+
+
+def _posterior_cdf(pdf_n, zg):
+    """Return a monotone CDF for a posterior PDF grid."""
+    dz = max(float(np.mean(np.diff(zg))), 1e-12)
+    cdf = np.cumsum(np.asarray(pdf_n, dtype=np.float64)) * dz
+    total = float(cdf[-1]) if len(cdf) else 0.0
+    if not (total > 1e-300 and np.isfinite(total)):
+        cdf = np.linspace(0.0, 1.0, len(pdf_n), dtype=np.float64)
+    else:
+        cdf /= total
+    if len(cdf):
+        cdf[0] = max(cdf[0], 0.0)
+        cdf[-1] = 1.0
+    return cdf
 
 
 def _fill_gaussian(res, k_mu, k_var, mk, n_grid, ci_prob):

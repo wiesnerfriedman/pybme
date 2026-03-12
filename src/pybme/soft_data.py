@@ -39,6 +39,7 @@ class SoftPDF:
         self.z_grid = np.asarray(z_grid, dtype=np.float64)
         self.pdf_values = np.asarray(pdf_values, dtype=np.float64)
         self.pdf_type = pdf_type
+        self._analytic = None  # set by from_truncnorm / from_gaussian
         self._normalize()
 
     # ── internal ──────────────────────────────────────────────
@@ -78,6 +79,50 @@ class SoftPDF:
         """(lower, upper) bounds of the support."""
         return (float(self.z_grid[0]), float(self.z_grid[-1]))
 
+    # ── analytic derivatives (for Laplace / Newton) ───────────
+
+    @property
+    def has_analytic_deriv(self):
+        """True when closed-form log-PDF derivatives are available."""
+        return self._analytic is not None
+
+    def log_pdf(self, x: float) -> float:
+        """Evaluate log f(x). Fast analytic path when available."""
+        if self._analytic is not None:
+            p = self._analytic
+            mu, sigma = p['mu'], p['sigma']
+            a, b = p['a'], p['b']
+            if x < a or x > b:
+                return -np.inf
+            z = (x - mu) / sigma
+            return -0.5 * z * z - p['_log_norm']
+        fi = self.evaluate(x)
+        if isinstance(fi, np.ndarray):
+            fi = float(fi.item())
+        return np.log(fi) if fi > 0.0 else -np.inf
+
+    def d_log_pdf(self, x: float) -> float:
+        """First derivative of log f(x). Requires analytic params."""
+        p = self._analytic
+        return -(x - p['mu']) / (p['sigma'] * p['sigma'])
+
+    def d2_log_pdf(self) -> float:
+        """Second derivative of log f(x) (constant for Gaussian kernel)."""
+        sigma = self._analytic['sigma']
+        return -1.0 / (sigma * sigma)
+
+    def shifted(self, offset: float) -> "SoftPDF":
+        """Return a copy with z-grid shifted by *offset* (z → z − offset)."""
+        new = SoftPDF(self.z_grid - offset, self.pdf_values.copy(), self.pdf_type)
+        if self._analytic is not None:
+            ap = self._analytic.copy()
+            ap['mu'] -= offset
+            ap['a'] -= offset
+            ap['b'] -= offset
+            # _log_norm stays the same (normalization constant is shift-invariant)
+            new._analytic = ap
+        return new
+
     def moments(self):
         """Numerically compute (mean, variance)."""
         zf = np.linspace(self.z_grid[0], self.z_grid[-1], 500)
@@ -93,8 +138,17 @@ class SoftPDF:
                       n_pts: int = 25, n_sig: float = 5):
         """Discretised Gaussian N(mean, var).  ≈ MATLAB ``probaGaussian``."""
         sig = np.sqrt(var)
-        z = np.linspace(mean - n_sig * sig, mean + n_sig * sig, n_pts)
-        return cls(z, norm.pdf(z, mean, sig), "linear")
+        a = mean - n_sig * sig
+        b = mean + n_sig * sig
+        z = np.linspace(a, b, n_pts)
+        obj = cls(z, norm.pdf(z, mean, sig), "linear")
+        import math as _m
+        obj._analytic = {
+            'mu': float(mean), 'sigma': float(sig),
+            'a': float(a), 'b': float(b),
+            '_log_norm': 0.5 * _m.log(2.0 * _m.pi) + _m.log(float(sig)),
+        }
+        return obj
 
     @classmethod
     def from_uniform(cls, a: float, b: float):
@@ -140,7 +194,16 @@ class SoftPDF:
         alpha = (a - mu) / sigma
         beta = (b - mu) / sigma
         z = np.linspace(a, b, n_pts)
-        return cls(z, _truncnorm_dist.pdf(z, alpha, beta, loc=mu, scale=sigma), "linear")
+        obj = cls(z, _truncnorm_dist.pdf(z, alpha, beta, loc=mu, scale=sigma), "linear")
+        import math as _m
+        # Pre-compute log normalisation constant (shift-invariant)
+        log_Z = _m.log(max(norm.cdf(beta) - norm.cdf(alpha), 1e-300))
+        obj._analytic = {
+            'mu': float(mu), 'sigma': float(sigma),
+            'a': float(a), 'b': float(b),
+            '_log_norm': 0.5 * _m.log(2.0 * _m.pi) + _m.log(float(sigma)) + log_Z,
+        }
+        return obj
 
     @classmethod
     def from_lognormal(cls, mu_log: float, sigma_log: float,

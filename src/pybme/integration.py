@@ -264,11 +264,16 @@ def _soft_log_pdf(soft_pdfs: List[SoftPDF], x: np.ndarray) -> float:
     """
     s = 0.0
     for i, sp in enumerate(soft_pdfs):
-        fi = sp.evaluate(float(x[i]))
-        if fi <= 0.0:
+        li = sp.log_pdf(float(x[i]))
+        if li == -np.inf:
             return -np.inf
-        s += math.log(fi)
+        s += li
     return s
+
+
+def _soft_log_pdf_single(sp: SoftPDF, xi: float) -> float:
+    """log fᵢ(xᵢ) for a single soft PDF.  Returns -inf if fᵢ ≤ 0."""
+    return sp.log_pdf(xi)
 
 
 def _log_target(x: np.ndarray, soft_pdfs: List[SoftPDF],
@@ -305,23 +310,26 @@ def _log_target_grad(x: np.ndarray, soft_pdfs: List[SoftPDF],
                      eps_arr: Optional[np.ndarray] = None) -> np.ndarray:
     """Gradient of log g(x) w.r.t. x.
 
-    The Gaussian part is computed analytically (−Q(x−μ)); the soft-PDF
-    part uses central finite differences with adaptive step sizes.
+    The Gaussian part is computed analytically (-Q(x-mu)); the soft-PDF
+    part uses analytic derivatives when available, falling back to central
+    finite differences.
     """
     ns = len(x)
-    if eps_arr is None:
-        eps_arr = _adaptive_eps(soft_pdfs)
     # Analytic Gaussian gradient
     grad = -Q @ (x - mu)
-    # Add numerical soft-PDF gradient via central differences
+    # Separable soft-PDF gradient
     for i in range(ns):
-        ei = eps_arr[i]
-        x_p, x_m = x.copy(), x.copy()
-        x_p[i] += ei
-        x_m[i] -= ei
-        lp = _soft_log_pdf(soft_pdfs, x_p)
-        lm = _soft_log_pdf(soft_pdfs, x_m)
-        grad[i] += (lp - lm) / (2.0 * ei)
+        sp = soft_pdfs[i]
+        xi = float(x[i])
+        if sp.has_analytic_deriv:
+            grad[i] += sp.d_log_pdf(xi)
+        else:
+            if eps_arr is None:
+                eps_arr = _adaptive_eps(soft_pdfs)
+            ei = eps_arr[i]
+            lp = _soft_log_pdf_single(sp, xi + ei)
+            lm = _soft_log_pdf_single(sp, xi - ei)
+            grad[i] += (lp - lm) / (2.0 * ei)
     return grad
 
 
@@ -330,41 +338,32 @@ def _log_target_hessian(x: np.ndarray, soft_pdfs: List[SoftPDF],
                         eps_arr: Optional[np.ndarray] = None) -> np.ndarray:
     """Hessian of log g(x).
 
-    The Gaussian part contributes −Q exactly; the soft-PDF curvature
-    is approximated via central finite differences with adaptive step
-    sizes (must span multiple interpolation grid segments).
+    The Gaussian part contributes -Q exactly.  Since each soft PDF f_i
+    depends only on x_i, the soft-PDF contribution is *diagonal*.
+    Uses analytic d²/dx² when available, central FD otherwise.
     """
     ns = len(x)
-    if eps_arr is None:
-        eps_arr = _adaptive_eps(soft_pdfs)
     H = -Q.copy()  # Exact Gaussian contribution
-    # Add soft-PDF Hessian numerically
-    l0 = _soft_log_pdf(soft_pdfs, x)
     for i in range(ns):
-        ei = eps_arr[i]
-        x_p, x_m = x.copy(), x.copy()
-        x_p[i] += ei
-        x_m[i] -= ei
-        lp = _soft_log_pdf(soft_pdfs, x_p)
-        lm = _soft_log_pdf(soft_pdfs, x_m)
-        H[i, i] += (lp - 2.0 * l0 + lm) / (ei ** 2)
-        for j in range(i + 1, ns):
-            ej = eps_arr[j]
-            xpp = x.copy(); xpp[i] += ei; xpp[j] += ej
-            xpm = x.copy(); xpm[i] += ei; xpm[j] -= ej
-            xmp = x.copy(); xmp[i] -= ei; xmp[j] += ej
-            xmm = x.copy(); xmm[i] -= ei; xmm[j] -= ej
-            cross = (_soft_log_pdf(soft_pdfs, xpp) - _soft_log_pdf(soft_pdfs, xpm)
-                     - _soft_log_pdf(soft_pdfs, xmp) + _soft_log_pdf(soft_pdfs, xmm)
-                     ) / (4.0 * ei * ej)
-            H[i, j] += cross
-            H[j, i] = H[i, j]
+        sp = soft_pdfs[i]
+        if sp.has_analytic_deriv:
+            H[i, i] += sp.d2_log_pdf()
+        else:
+            if eps_arr is None:
+                eps_arr = _adaptive_eps(soft_pdfs)
+            ei = eps_arr[i]
+            xi = float(x[i])
+            l0 = _soft_log_pdf_single(sp, xi)
+            lp = _soft_log_pdf_single(sp, xi + ei)
+            lm = _soft_log_pdf_single(sp, xi - ei)
+            H[i, i] += (lp - 2.0 * l0 + lm) / (ei ** 2)
     return H
 
 
 def _find_mode(soft_pdfs: List[SoftPDF], mu: np.ndarray,
                Q: np.ndarray, max_iter: int = 30,
-               tol: float = 1e-6) -> np.ndarray:
+               tol: float = 1e-6,
+               x0: Optional[np.ndarray] = None) -> np.ndarray:
     """Newton's method to find the mode of log g(x).
 
     Uses a modified Newton step with backtracking line search.
@@ -374,10 +373,12 @@ def _find_mode(soft_pdfs: List[SoftPDF], mu: np.ndarray,
     # Compute support bounds for clamping
     lo = np.array([sp.support[0] for sp in soft_pdfs])
     hi = np.array([sp.support[1] for sp in soft_pdfs])
-    # Start from mu clamped to within supports
-    x = np.clip(mu.copy(), lo, hi)
+    # Start from x0 (warm-start) or mu, clamped to supports
+    x = np.clip(x0 if x0 is not None else mu.copy(), lo, hi)
 
-    eps_arr = _adaptive_eps(soft_pdfs)
+    # Only compute FD step sizes if any PDF lacks analytic derivatives
+    all_analytic = all(sp.has_analytic_deriv for sp in soft_pdfs)
+    eps_arr = None if all_analytic else _adaptive_eps(soft_pdfs)
     for _ in range(max_iter):
         g = _log_target_grad(x, soft_pdfs, mu, Q, eps_arr)
         H = _log_target_hessian(x, soft_pdfs, mu, Q, eps_arr)
@@ -455,6 +456,10 @@ def integrate_soft_laplace_batch(soft_pdfs: List[SoftPDF],
                                  cov: np.ndarray) -> np.ndarray:
     """Batch Laplace approximation for multiple conditional means.
 
+    When all soft PDFs have analytic constant Hessians (Gaussian /
+    TruncNormal), uses a fully vectorized Newton solver over all M
+    z-grid points simultaneously — no Python loop.
+
     Parameters
     ----------
     soft_pdfs : list of SoftPDF (length ns)
@@ -475,12 +480,19 @@ def integrate_soft_laplace_batch(soft_pdfs: List[SoftPDF],
     Q = np.linalg.inv(cov)
     _, logdet_prior = np.linalg.slogdet(Q)
 
+    # ── fully vectorized fast path ──────────────────────────────
+    all_analytic = all(sp.has_analytic_deriv for sp in soft_pdfs)
+    if all_analytic:
+        return _laplace_batch_vectorized(
+            soft_pdfs, mu_grid, Q, logdet_prior)
+
+    # ── scalar fallback for non-analytic PDFs ───────────────────
     result = np.empty(M)
     x_prev = None
     for j in range(M):
         mu_j = mu_grid[j]
         try:
-            x_star = _find_mode(soft_pdfs, mu_j, Q, max_iter=20)
+            x_star = _find_mode(soft_pdfs, mu_j, Q, max_iter=20, x0=x_prev)
             x_prev = x_star
 
             H = _log_target_hessian(x_star, soft_pdfs, mu_j, Q)
@@ -500,6 +512,69 @@ def integrate_soft_laplace_batch(soft_pdfs: List[SoftPDF],
             result[j] = 1e-300
 
     return result
+
+
+def _laplace_batch_vectorized(soft_pdfs: List[SoftPDF],
+                              mu_grid: np.ndarray,
+                              Q: np.ndarray,
+                              logdet_prior: float) -> np.ndarray:
+    """Fully vectorized Laplace batch — all M z-grid points at once.
+
+    Exploits:
+      * Constant Hessian (TruncNormal/Gaussian → d²/dx² = −1/σ²)
+      * Analytic gradient (no FD)
+      * Vectorized Newton over (M, ns) arrays
+    """
+    ns = len(soft_pdfs)
+    M = mu_grid.shape[0]
+
+    # Extract per-PDF parameters as arrays  (ns,)
+    sp_mu = np.array([sp._analytic['mu'] for sp in soft_pdfs])
+    sp_inv_var = np.array([1.0 / (sp._analytic['sigma'] ** 2) for sp in soft_pdfs])
+    sp_log_norm = np.array([sp._analytic['_log_norm'] for sp in soft_pdfs])
+    lo = np.array([sp._analytic['a'] for sp in soft_pdfs])
+    hi = np.array([sp._analytic['b'] for sp in soft_pdfs])
+
+    # Constant negative Hessian:  neg_H = Q + diag(1/σ²)
+    neg_H = Q + np.diag(sp_inv_var)
+    ev = np.linalg.eigvalsh(neg_H)
+    if ev.min() <= 0:
+        neg_H += (abs(ev.min()) + 1e-6) * np.eye(ns)
+    _, logdet_post = np.linalg.slogdet(neg_H)
+    half_ld = 0.5 * (logdet_prior - logdet_post)
+
+    # Pre-compute (−H)⁻¹ for Newton step
+    neg_H_inv = np.linalg.inv(neg_H)
+
+    # ── vectorized Newton ───────────────────────────────────────
+    # x: (M, ns) — all M modes simultaneously
+    x = np.clip(mu_grid.copy(), lo, hi)
+
+    for _ in range(20):
+        # Gradient:  grad = -Q(x - mu) - (x - sp_mu) / σ²
+        d_gauss = x - mu_grid                  # (M, ns)
+        grad = -(d_gauss @ Q) - (x - sp_mu) * sp_inv_var   # (M, ns)
+        # Newton step:  step = neg_H_inv @ grad  (broadcast: (M,ns) @ (ns,ns)^T)
+        step = grad @ neg_H_inv                # (M, ns)
+        x_new = np.clip(x + step, lo, hi)
+        if np.max(np.abs(x_new - x)) < 1e-6:
+            x = x_new
+            break
+        x = x_new
+
+    # ── vectorized log-target at all modes ──────────────────────
+    d = x - mu_grid
+    gauss_part = -0.5 * np.sum(d @ Q * d, axis=1)  # (M,)
+    z_sc = (x - sp_mu) / np.sqrt(1.0 / sp_inv_var)
+    soft_part = np.sum(-0.5 * z_sc ** 2 - sp_log_norm, axis=1)  # (M,)
+
+    # Mask out-of-support points  (shouldn't happen with clamping, but safety)
+    in_support = np.all((x >= lo) & (x <= hi), axis=1)
+    log_g = gauss_part + soft_part
+    log_g[~in_support] = -np.inf
+
+    log_I = log_g + half_ld
+    return np.maximum(np.exp(np.clip(log_I, -700, 500)), 1e-300)
 
 
 # ════════════════════════════════════════════════════════════════

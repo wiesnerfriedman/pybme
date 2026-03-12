@@ -482,3 +482,228 @@ def network_kriging_precision(
         var = np.full(len(est_nodes), np.nan)
 
     return mu, var
+
+
+# ════════════════════════════════════════════════════════════════
+# §5  MASS-BALANCE OPERATOR & PHYSICS-INFORMED PRECISION
+# ════════════════════════════════════════════════════════════════
+
+def build_mass_balance_operator(
+    n_nodes: int,
+    directed_edges: np.ndarray,
+    *,
+    routing_weights: Optional[np.ndarray] = None,
+) -> sparse.csc_matrix:
+    """Build the directed mass-balance (flow-conservation) operator H.
+
+    For each non-source node *j* with directed parents {p₁, … , pₖ},
+    one row of H encodes the constraint
+
+        x_j − Σᵢ wᵢ · x_{pᵢ}  ≈ 0        (no lateral inflow)
+
+    where wᵢ are optional routing fractions (default 1.0).
+
+    Parameters
+    ----------
+    n_nodes : int
+        Total number of nodes.
+    directed_edges : (E, 2) int array
+        Each row ``(i, j)`` is a directed edge from *i* → *j*.
+    routing_weights : (E,) optional
+        Per-edge routing/attenuation weights.  Default is 1.0 for every edge.
+
+    Returns
+    -------
+    H : (n_constraints, n_nodes) sparse CSC matrix.
+        One row per non-source node (nodes with at least one incoming edge).
+
+    Notes
+    -----
+    The symmetric product ``M = H.T @ H`` is positive semi-definite and its
+    quadratic form ``x.T @ M @ x = Σⱼ (xⱼ − Σᵢ wᵢ xᵢ)²`` sums the squared
+    mass-balance residuals over all junction nodes.
+    """
+    directed_edges = np.asarray(directed_edges, dtype=int)
+    if routing_weights is None:
+        routing_weights = np.ones(len(directed_edges), dtype=np.float64)
+    else:
+        routing_weights = np.asarray(routing_weights, dtype=np.float64)
+
+    # Find parent list for each node
+    parents: dict = {}  # node_j -> list of (parent_i, weight)
+    for k, (i, j) in enumerate(directed_edges):
+        parents.setdefault(int(j), []).append((int(i), routing_weights[k]))
+
+    # Build H: one row per node that has at least one parent
+    rows, cols, vals = [], [], []
+    constraint_idx = 0
+    constraint_nodes = []
+    for j in sorted(parents.keys()):
+        # +1 for the node itself
+        rows.append(constraint_idx)
+        cols.append(j)
+        vals.append(1.0)
+        # −w for each parent
+        for p, w in parents[j]:
+            rows.append(constraint_idx)
+            cols.append(p)
+            vals.append(-w)
+        constraint_nodes.append(j)
+        constraint_idx += 1
+
+    H = sparse.csc_matrix(
+        (vals, (rows, cols)),
+        shape=(constraint_idx, n_nodes),
+    )
+    return H
+
+
+class PhysicsInformedNetworkCovariance:
+    """Network covariance with mass-balance penalty built into the prior.
+
+    Precision matrix:
+
+        Q = (1/σ²)(κ²I  +  α·L  +  λ·HᵀH)
+
+    where
+
+    * **κ²I** — regularisation that keeps Q strictly positive-definite.
+    * **α·L** — standard undirected-Laplacian smoothness
+      (set ``alpha=0`` to remove smoothness entirely).
+    * **λ·HᵀH** — mass-balance penalty.  ``H`` is the directed
+      flow-conservation operator from :func:`build_mass_balance_operator`.
+      Higher ``lam`` penalises conservation violations more heavily,
+      so the prior concentrates on flow fields that satisfy
+      downstream accumulation.
+
+    The interface (``covariance_block``, ``marginal_variance``, ``Q``)
+    matches :class:`NetworkCovariance` so it can be used directly in
+    :func:`~pybme.predict.bme_predict_network` and
+    :class:`NetworkCovarianceST`.
+
+    Parameters
+    ----------
+    laplacian : (N, N) sparse graph Laplacian **or** adjacency matrix when
+                ``from_adjacency=True``.
+    directed_edges : (E, 2) int array of directed edges (i → j).
+    kappa : float
+        Regularisation / spatial-scale parameter.
+    sigma2 : float
+        Overall sill.
+    alpha : float
+        Weight on the undirected-Laplacian smoothness term (default 1.0).
+    lam : float
+        Weight on the mass-balance penalty ``HᵀH`` (default 1.0).
+    routing_weights : (E,) optional per-edge mass-balance weights.
+    from_adjacency : bool
+        If True, treat *laplacian* as an adjacency matrix.
+    normalised : bool
+        Use the normalised Laplacian (only when ``from_adjacency=True``).
+    """
+
+    def __init__(
+        self,
+        laplacian: Union[np.ndarray, sparse.spmatrix],
+        directed_edges: np.ndarray,
+        kappa: float,
+        sigma2: float = 1.0,
+        alpha: float = 1.0,
+        lam: float = 1.0,
+        *,
+        routing_weights: Optional[np.ndarray] = None,
+        from_adjacency: bool = False,
+        normalised: bool = False,
+    ):
+        self.kappa = float(kappa)
+        self.sigma2 = float(sigma2)
+        self.alpha = float(alpha)
+        self.lam = float(lam)
+
+        if from_adjacency:
+            self.L = build_graph_laplacian(laplacian, normalised=normalised)
+        else:
+            self.L = sparse.csc_matrix(laplacian, dtype=np.float64)
+
+        self.n_nodes = self.L.shape[0]
+        self.H = build_mass_balance_operator(
+            self.n_nodes, directed_edges, routing_weights=routing_weights,
+        )
+        self.M = (self.H.T @ self.H).tocsc()  # mass-balance gram matrix
+
+        self.method = "physics_informed"
+
+        self.Q: sparse.csc_matrix = self._build_precision()
+        self._C_dense: Optional[np.ndarray] = None
+        self._Q_factor = None
+
+    # ── internal builders ────────────────────────────────────
+
+    def _build_precision(self) -> sparse.csc_matrix:
+        """Q = (1/σ²)(κ²I + α L + λ HᵀH)."""
+        k2 = self.kappa ** 2
+        I_n = sparse.eye(self.n_nodes, format="csc")
+        Q = (k2 * I_n + self.alpha * self.L + self.lam * self.M) / self.sigma2
+        Q = 0.5 * (Q + Q.T)
+        return Q.tocsc()
+
+    def _get_factor(self):
+        if self._Q_factor is None:
+            self._Q_factor = splu(self.Q.tocsc())
+        return self._Q_factor
+
+    @property
+    def C_dense(self) -> np.ndarray:
+        if self._C_dense is None:
+            self._C_dense = self.sigma2 * np.linalg.inv(
+                (self.kappa ** 2 * sparse.eye(self.n_nodes)
+                 + self.alpha * self.L
+                 + self.lam * self.M).toarray()
+            )
+            self._C_dense = 0.5 * (self._C_dense + self._C_dense.T)
+        return self._C_dense
+
+    # ── sub-block extraction ─────────────────────────────────
+
+    def covariance_block(
+        self,
+        idx1: np.ndarray,
+        idx2: np.ndarray,
+    ) -> np.ndarray:
+        idx1 = np.atleast_1d(np.asarray(idx1, dtype=int))
+        idx2 = np.atleast_1d(np.asarray(idx2, dtype=int))
+
+        if self.n_nodes <= 5000 or self._C_dense is not None:
+            return self.C_dense[np.ix_(idx1, idx2)]
+
+        factor = self._get_factor()
+        n = self.n_nodes
+        block = np.empty((len(idx1), len(idx2)))
+        for j_out, j_node in enumerate(idx2):
+            e = np.zeros(n)
+            e[j_node] = 1.0
+            col = self.sigma2 * factor.solve(e)
+            block[:, j_out] = col[idx1]
+        return block
+
+    def __call__(
+        self,
+        idx1: np.ndarray,
+        idx2: np.ndarray,
+    ) -> np.ndarray:
+        return self.covariance_block(idx1, idx2)
+
+    def marginal_variance(self, idx: Optional[np.ndarray] = None) -> np.ndarray:
+        if idx is None:
+            idx = np.arange(self.n_nodes)
+        idx = np.atleast_1d(np.asarray(idx, dtype=int))
+
+        if self.n_nodes <= 5000 or self._C_dense is not None:
+            return np.diag(self.C_dense)[idx]
+
+        factor = self._get_factor()
+        var = np.empty(len(idx))
+        for j, i_node in enumerate(idx):
+            e = np.zeros(self.n_nodes)
+            e[i_node] = 1.0
+            var[j] = self.sigma2 * factor.solve(e)[i_node]
+        return var

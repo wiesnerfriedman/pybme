@@ -98,9 +98,28 @@ from .spde import (
 from .network import (
     NetworkCovariance,
     NetworkCovarianceST,
+    PhysicsInformedNetworkCovariance,
     build_graph_laplacian,
+    build_mass_balance_operator,
     adjacency_from_edges,
     network_kriging_precision,
+)
+
+# Network-domain plotting
+from .network_plots import (
+    plot_network_observations,
+    plot_network_field,
+    plot_network_correlation,
+    plot_operator,
+)
+from .swmm import (
+    SwmmNetwork,
+    ObservationTable,
+    parse_swmm_inp,
+    build_edge_array,
+    read_meter_node_map,
+    read_observation_csv,
+    nearest_timeseries_value,
 )
 
 # fitting & validation
@@ -142,9 +161,19 @@ __all__ = [
     "spde_kriging", "snap_to_mesh",
     # Network-domain
     "NetworkCovariance", "NetworkCovarianceST",
-    "build_graph_laplacian", "adjacency_from_edges",
+    "PhysicsInformedNetworkCovariance",
+    "build_graph_laplacian", "build_mass_balance_operator",
+    "adjacency_from_edges",
     "network_kriging_precision",
     "bme_predict_network", "bme_predict_network_st",
+    # Network-domain plotting
+    "plot_network_observations", "plot_network_field",
+    "plot_network_correlation", "plot_operator",
+    # SWMM utilities
+    "SwmmNetwork", "ObservationTable",
+    "parse_swmm_inp", "build_edge_array",
+    "read_meter_node_map", "read_observation_csv",
+    "nearest_timeseries_value",
     # fitting / validation
     "fit_covariance", "cross_validate",
 ]

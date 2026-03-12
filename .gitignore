@@ -31,3 +31,10 @@ Thumbs.db
 
 # Memory
 memory/
+
+# Private SWMM example assets
+examples/private_swmm/
+examples/data/private_swmm/
+
+# Generated example figures
+examples/figures/

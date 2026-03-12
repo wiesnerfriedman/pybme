@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 import numpy as np
-from .soft_data import SoftPDF
 
 
 def design_matrix(coords: np.ndarray, order) -> np.ndarray:
@@ -46,10 +45,7 @@ def estimate_trend(ch, zh, cs, soft_pdfs, ck, order, mean_prior):
     """
     if order is None or (isinstance(order, float) and np.isnan(order)):
         zh_dt = zh - mean_prior
-        sp_dt = [
-            SoftPDF(sp.z_grid - mean_prior, sp.pdf_values.copy(), sp.pdf_type)
-            for sp in soft_pdfs
-        ]
+        sp_dt = [sp.shifted(mean_prior) for sp in soft_pdfs]
         return zh_dt, sp_dt, mean_prior, np.full(len(zh), mean_prior), np.zeros(len(soft_pdfs))
 
     Xh = design_matrix(ch, order)
@@ -79,7 +75,7 @@ def estimate_trend(ch, zh, cs, soft_pdfs, ck, order, mean_prior):
 
     zh_dt = zh - trend_h
     sp_dt = [
-        SoftPDF(sp.z_grid - trend_s[i], sp.pdf_values.copy(), sp.pdf_type)
+        sp.shifted(trend_s[i])
         for i, sp in enumerate(soft_pdfs)
     ]
     return zh_dt, sp_dt, mk, trend_h, trend_s

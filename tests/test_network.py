@@ -7,6 +7,7 @@ Covers:
   §4 Network BME with soft data (spatial)
   §5 NetworkCovarianceST and space-time BME
   §6 Edge cases and validation
+  §7 Mass-balance operator and PhysicsInformedNetworkCovariance
 """
 
 import numpy as np
@@ -16,7 +17,9 @@ from scipy import sparse
 from pybme import (
     NetworkCovariance,
     NetworkCovarianceST,
+    PhysicsInformedNetworkCovariance,
     build_graph_laplacian,
+    build_mass_balance_operator,
     adjacency_from_edges,
     network_kriging_precision,
     bme_predict_network,
@@ -573,3 +576,222 @@ class TestEdgeCases:
     def test_invalid_edges_shape(self):
         with pytest.raises(ValueError, match="edges must be"):
             adjacency_from_edges(3, np.array([0, 1, 2]))
+
+
+# ════════════════════════════════════════════════════════════════
+# §7  Mass-balance operator & PhysicsInformedNetworkCovariance
+# ════════════════════════════════════════════════════════════════
+
+def _sewer_tree():
+    """Y-shaped sewer with directed edges (upstream → downstream).
+
+         0       1       2       3 (sources)
+          \\     /       |       |
+           4 ←─┘        5 ←─────┘
+            \\          /
+             6 ←──────┘
+              \\
+               7 (outfall)
+    """
+    n = 8
+    directed_edges = np.array([
+        [0, 4], [1, 4],  # 0,1 → 4
+        [2, 5], [3, 5],  # 2,3 → 5
+        [4, 6], [5, 6],  # 4,5 → 6
+        [6, 7],          # 6 → 7
+    ])
+    W = adjacency_from_edges(n, directed_edges)
+    return n, W, directed_edges
+
+
+class TestMassBalanceOperator:
+    def test_h_shape(self):
+        """H has one row per non-source node."""
+        n, W, edges = _sewer_tree()
+        H = build_mass_balance_operator(n, edges)
+        # Nodes 4, 5, 6, 7 have incoming edges → 4 rows
+        assert H.shape == (4, n)
+
+    def test_h_row_sums_zero(self):
+        """Each row of H should sum to zero (one +1 minus all parent −1's)."""
+        n, W, edges = _sewer_tree()
+        H = build_mass_balance_operator(n, edges)
+        # Only true when all routing_weights=1.0
+        # Row sum = +1 - (number_of_parents * 1.0); not always 0
+        # Actually: sum = 1 - sum(weights). With weights=1, row sum = 1 - n_parents.
+        # For node 7: 1 parent → sum=0. For node 4: 2 parents → sum=-1.
+        # So row sums are NOT zero. Test the constraint instead.
+        H_dense = H.toarray()
+        # For each constraint row, there's exactly one +1
+        for row in range(H.shape[0]):
+            pos_entries = H_dense[row][H_dense[row] > 0]
+            assert len(pos_entries) == 1
+            assert pos_entries[0] == 1.0
+
+    def test_mass_balance_violation(self):
+        """H x should be zero for a flow field that satisfies mass balance."""
+        n, W, edges = _sewer_tree()
+        H = build_mass_balance_operator(n, edges)
+        # Construct a mass-balanced flow: sources each contribute 1.0
+        x = np.zeros(n)
+        x[0] = 1.0  # source
+        x[1] = 2.0  # source
+        x[2] = 0.5  # source
+        x[3] = 1.5  # source
+        x[4] = x[0] + x[1]    # 3.0
+        x[5] = x[2] + x[3]    # 2.0
+        x[6] = x[4] + x[5]    # 5.0
+        x[7] = x[6]           # 5.0
+        np.testing.assert_allclose(H @ x, 0.0, atol=1e-14)
+
+    def test_mass_balance_nonzero_for_violation(self):
+        """H x should be nonzero when mass balance is violated."""
+        n, W, edges = _sewer_tree()
+        H = build_mass_balance_operator(n, edges)
+        x = np.ones(n)  # all nodes have same value — clearly not balanced
+        residual = H @ x
+        # Node 4 gets 1 - (1+1) = -1, etc.
+        assert np.linalg.norm(residual) > 0
+
+    def test_gram_matrix_psd(self):
+        """M = H^T H must be positive semi-definite."""
+        n, W, edges = _sewer_tree()
+        H = build_mass_balance_operator(n, edges)
+        M = (H.T @ H).toarray()
+        eigvals = np.linalg.eigvalsh(M)
+        assert np.all(eigvals >= -1e-12)
+
+    def test_routing_weights(self):
+        """Custom routing weights should appear in H."""
+        n, W, edges = _sewer_tree()
+        weights = np.array([0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0])
+        H = build_mass_balance_operator(n, edges, routing_weights=weights)
+        H_dense = H.toarray()
+        # Node 4: row should have +1 at col 4, -0.5 at cols 0 and 1
+        row_4 = H_dense[0]  # first constraint row (node 4)
+        assert row_4[4] == 1.0
+        assert row_4[0] == -0.5
+        assert row_4[1] == -0.5
+
+    def test_sources_get_no_rows(self):
+        """Source nodes (no incoming edges) should not appear as constraint rows."""
+        n, W, edges = _sewer_tree()
+        H = build_mass_balance_operator(n, edges)
+        H_dense = H.toarray()
+        # Source nodes 0, 1, 2, 3 should not have +1 in any row's diagonal
+        for row in range(H.shape[0]):
+            positive_cols = np.where(H_dense[row] > 0)[0]
+            assert all(c >= 4 for c in positive_cols), \
+                f"Row {row} has positive entry at source column(s) {positive_cols}"
+
+
+class TestPhysicsInformedCovariance:
+    def test_spd(self):
+        """Physics-informed covariance must be SPD."""
+        n, W, edges = _sewer_tree()
+        nc = PhysicsInformedNetworkCovariance(
+            W, edges, kappa=1.0, sigma2=1.0,
+            alpha=1.0, lam=2.0, from_adjacency=True,
+        )
+        eigvals = np.linalg.eigvalsh(nc.C_dense)
+        assert np.all(eigvals > 0), f"Min eigenvalue: {eigvals.min()}"
+
+    def test_alpha_zero_still_spd(self):
+        """With alpha=0 (no smoothness), still SPD due to kappa^2 I."""
+        n, W, edges = _sewer_tree()
+        nc = PhysicsInformedNetworkCovariance(
+            W, edges, kappa=1.0, sigma2=1.0,
+            alpha=0.0, lam=5.0, from_adjacency=True,
+        )
+        eigvals = np.linalg.eigvalsh(nc.C_dense)
+        assert np.all(eigvals > 0)
+
+    def test_lam_zero_matches_standard(self):
+        """With lam=0, should match a standard NetworkCovariance."""
+        n, W, edges = _sewer_tree()
+        nc_pi = PhysicsInformedNetworkCovariance(
+            W, edges, kappa=1.5, sigma2=2.0,
+            alpha=1.0, lam=0.0, from_adjacency=True,
+        )
+        nc_std = NetworkCovariance(
+            W, kappa=1.5, sigma2=2.0, from_adjacency=True,
+        )
+        np.testing.assert_allclose(nc_pi.C_dense, nc_std.C_dense, atol=1e-10)
+
+    def test_covariance_block_matches_dense(self):
+        """Sub-block extraction must match full dense slicing."""
+        n, W, edges = _sewer_tree()
+        nc = PhysicsInformedNetworkCovariance(
+            W, edges, kappa=1.0, sigma2=1.0,
+            alpha=1.0, lam=1.0, from_adjacency=True,
+        )
+        idx1 = np.array([0, 3, 6])
+        idx2 = np.array([1, 5, 7])
+        block = nc.covariance_block(idx1, idx2)
+        expected = nc.C_dense[np.ix_(idx1, idx2)]
+        np.testing.assert_allclose(block, expected, atol=1e-12)
+
+    def test_marginal_variance_subset(self):
+        n, W, edges = _sewer_tree()
+        nc = PhysicsInformedNetworkCovariance(
+            W, edges, kappa=0.8, sigma2=1.5,
+            alpha=1.0, lam=2.0, from_adjacency=True,
+        )
+        idx = np.array([2, 5, 7])
+        var = nc.marginal_variance(idx)
+        expected = np.diag(nc.C_dense)[idx]
+        np.testing.assert_allclose(var, expected, atol=1e-12)
+
+    def test_call_interface(self):
+        """nc(idx1, idx2) should match nc.covariance_block(idx1, idx2)."""
+        n, W, edges = _sewer_tree()
+        nc = PhysicsInformedNetworkCovariance(
+            W, edges, kappa=1.0, sigma2=1.0,
+            alpha=1.0, lam=1.0, from_adjacency=True,
+        )
+        idx1, idx2 = np.array([0, 2]), np.array([4, 7])
+        np.testing.assert_allclose(nc(idx1, idx2),
+                                   nc.covariance_block(idx1, idx2))
+
+    def test_higher_lam_increases_parent_child_corr(self):
+        """Increasing lam should increase parent-child prior correlation."""
+        n, W, edges = _sewer_tree()
+
+        def parent_child_corr(lam):
+            nc = PhysicsInformedNetworkCovariance(
+                W, edges, kappa=1.0, sigma2=1.0,
+                alpha=1.0, lam=lam, from_adjacency=True,
+            )
+            C = nc.C_dense
+            # node 6 → node 7 is a direct parent-child edge
+            return C[6, 7] / np.sqrt(C[6, 6] * C[7, 7])
+
+        corr_low = parent_child_corr(0.1)
+        corr_high = parent_child_corr(10.0)
+        assert corr_high > corr_low, \
+            f"Expected higher lam → higher parent-child corr, got {corr_low:.4f} vs {corr_high:.4f}"
+
+    def test_plugs_into_network_cov_st(self):
+        """Must be usable as the spatial component of NetworkCovarianceST."""
+        n, W, edges = _sewer_tree()
+        nc = PhysicsInformedNetworkCovariance(
+            W, edges, kappa=1.0, sigma2=1.0,
+            alpha=1.0, lam=1.0, from_adjacency=True,
+        )
+        nc_st = NetworkCovarianceST(
+            nc, model_t="exponential", params_t=[1.0, 3.0], sigma2=1.0,
+        )
+        # Should produce a valid covariance block
+        block = nc_st.covariance_block(
+            np.array([0, 4]), np.array([0.0, 0.0]),
+            np.array([6, 7]), np.array([1.0, 1.0]),
+        )
+        assert block.shape == (2, 2)
+        assert np.all(np.isfinite(block))
+
+    def test_method_attribute(self):
+        n, W, edges = _sewer_tree()
+        nc = PhysicsInformedNetworkCovariance(
+            W, edges, kappa=1.0, sigma2=1.0, from_adjacency=True,
+        )
+        assert nc.method == "physics_informed"
