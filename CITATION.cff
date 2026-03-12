@@ -1,0 +1,58 @@
+cff-version: 1.2.0
+message: >-
+  If you use PyBME in published work, please cite the software and the
+  foundational BME references described below.
+title: PyBME
+abstract: >-
+  PyBME is a pure-Python implementation of Bayesian Maximum Entropy (BME)
+  geostatistics, including soft-data integration, space-time BME, SPDE/GMRF
+  methods, Laplace approximation, EP, QMC, LIS, and network-domain BME.
+  Its baseline network implementation uses a graph-Laplacian covariance on
+  network topology, with separate SWMM and physics-informed examples for
+  flow-informed priors. The PyBME-specific extensions are still under review
+  and should be considered experimental until peer review is complete.
+type: software
+authors:
+  - family-names: Wiesner-Friedman
+    given-names: Corinne
+version: 0.5.0
+license: MIT
+keywords:
+  - geostatistics
+  - BME
+  - kriging
+  - soft-data
+  - spatial statistics
+  - network-domain geostatistics
+  - network kriging
+  - network BME
+  - graph Laplacian
+  - river networks
+  - sewer networks
+preferred-citation:
+  type: software
+  authors:
+    - family-names: Wiesner-Friedman
+      given-names: Corinne
+  title: PyBME
+  version: 0.5.0
+notes: >-
+  PyBME is a Python implementation inspired by the MATLAB BMElib framework.
+  For methodological attribution, please also cite the foundational BME
+  references listed in the repository README. For network-domain work,
+  PyBME-specific extensions are still under review and should be considered
+  experimental until peer review is complete. PyBME's baseline
+  graph-Laplacian covariance implementation is distinct
+  from earlier Money-Serre network BME formulations and from Jat-Serre
+  gradual-flow covariance BME formulations, which should be cited
+  separately when used. Relevant external references include Money, Carter,
+  and Serre (2009, Environ. Sci. Technol., doi:10.1021/es803236j); Money,
+  Carter, and Serre (2009, Water Res., doi:10.1016/j.watres.2009.01.034);
+  Jat and Serre (2016, Environ. Pollut.,
+  doi:10.1016/j.envpol.2016.09.020); and Jat and Serre (2018, Stoch.
+  Environ. Res. Risk Assess., doi:10.1007/s00477-018-1512-6). For the
+  stream-network modelling software ecosystem, see Ver Hoef, Peterson, and
+  Theobald (2006, doi:10.1007/s10651-006-0022-8), Ver Hoef and Peterson
+  (2010, doi:10.1198/jasa.2009.ap08248), Peterson and Ver Hoef (2014,
+  STARS, doi:10.18637/jss.v056.i02), and Dumelle et al. (2024, SSN2,
+  doi:10.21105/joss.06389).
