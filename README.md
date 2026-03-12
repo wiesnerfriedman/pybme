@@ -22,6 +22,7 @@ At a high level, the repository contains:
 * [Tutorials, examples, tests, and support material](#tutorials-examples-tests-and-support-material)
 * [How to cite and attribution](#how-to-cite-and-attribution)
 * [Comparison to MATLAB BMElib](#comparison-to-matlab-bmelib)
+* [AI-assisted development](#ai-assisted-development)
 * [License](#license)
 
 ---
@@ -579,6 +580,12 @@ If your work uses or compares against river-distance BME, gradual-flow covarianc
 | Cross-validation | Manual scripting | Built-in `cross_validate()` |
 | Neighbourhood | `neighbours()` | `select_neighbors()` / `_st()` plus KD-tree-backed indices |
 | Installation | MATLAB path setup | `pip install -e .` |
+
+---
+
+## AI-assisted development
+
+Code implementation, documentation, and test scaffolding were developed with the assistance of GitHub Copilot (LLM-based coding assistant). All mathematical formulations, methodological choices, research direction, and validation were performed by the author.
 
 ---
 
