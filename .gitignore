@@ -25,6 +25,9 @@ htmlcov/
 # VS Code
 .vscode/
 
+# Archives
+*.zip
+
 # OS
 .DS_Store
 Thumbs.db
