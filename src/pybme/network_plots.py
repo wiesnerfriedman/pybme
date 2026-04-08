@@ -47,6 +47,57 @@ def _draw_edges(ax, edges, coords, **kwargs):
             ax.plot([x0, x1], [y0, y1], **kw)
 
 
+def _build_flowline_segment_data(
+    node_names: Sequence[str],
+    coords: Dict[str, Tuple[float, float]],
+    edges: Sequence[Tuple[str, str, float]],
+    values: np.ndarray,
+    *,
+    n_edge_subsegments: int = 12,
+) -> Tuple[list[list[Tuple[float, float]]], np.ndarray, list[list[Tuple[float, float]]]]:
+    """Discretise edges into short line segments with interpolated values."""
+    if n_edge_subsegments < 1:
+        raise ValueError("n_edge_subsegments must be at least 1")
+
+    node_idx = {name: i for i, name in enumerate(node_names)}
+    coloured_segments = []
+    segment_values = []
+    grey_segments = []
+
+    for edge in edges:
+        from_node, to_node = edge[0], edge[1]
+        if from_node not in coords or to_node not in coords:
+            continue
+
+        x0, y0 = coords[from_node]
+        x1, y1 = coords[to_node]
+        from_idx = node_idx.get(from_node)
+        to_idx = node_idx.get(to_node)
+        if from_idx is None or to_idx is None:
+            grey_segments.append([(x0, y0), (x1, y1)])
+            continue
+
+        value_from = float(values[from_idx])
+        value_to = float(values[to_idx])
+        if not (np.isfinite(value_from) and np.isfinite(value_to)):
+            grey_segments.append([(x0, y0), (x1, y1)])
+            continue
+
+        for sub_idx in range(n_edge_subsegments):
+            alpha0 = sub_idx / n_edge_subsegments
+            alpha1 = (sub_idx + 1) / n_edge_subsegments
+            seg_x0 = x0 + (x1 - x0) * alpha0
+            seg_y0 = y0 + (y1 - y0) * alpha0
+            seg_x1 = x0 + (x1 - x0) * alpha1
+            seg_y1 = y0 + (y1 - y0) * alpha1
+            coloured_segments.append([(seg_x0, seg_y0), (seg_x1, seg_y1)])
+
+            midpoint = 0.5 * (alpha0 + alpha1)
+            segment_values.append(value_from + (value_to - value_from) * midpoint)
+
+    return coloured_segments, np.asarray(segment_values, dtype=float), grey_segments
+
+
 # ════════════════════════════════════════════════════════════════
 # Public API
 # ════════════════════════════════════════════════════════════════
@@ -86,6 +137,7 @@ def plot_network_observations(
     (fig, ax)
     """
     plt = _import_plt()
+    created_fig = ax is None
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
     else:
@@ -184,6 +236,7 @@ def plot_network_field(
     (fig, ax)
     """
     plt = _import_plt()
+    created_fig = ax is None
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
     else:
@@ -224,7 +277,142 @@ def plot_network_field(
     ax.set_aspect("equal")
     if obs_nodes is not None:
         ax.legend(fontsize=8, loc="lower right")
-    fig.tight_layout()
+    if created_fig:
+        fig.tight_layout()
+    return fig, ax
+
+
+def plot_network_flowlines(
+    node_names: Sequence[str],
+    coords: Dict[str, Tuple[float, float]],
+    edges: Sequence[Tuple[str, str, float]],
+    values: np.ndarray,
+    *,
+    obs_nodes: Optional[Sequence[int]] = None,
+    title: str = "",
+    cmap: str = "YlOrRd",
+    units: str = "",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    vmax_percentile: Optional[float] = 95,
+    clip_label: bool = True,
+    linewidth: float = 3.0,
+    base_edge_color: str = "lightgray",
+    base_edge_width: float = 0.7,
+    base_edge_alpha: float = 0.55,
+    n_edge_subsegments: int = 12,
+    show_nodes: bool = False,
+    node_size: float = 10,
+    obs_marker: str = "^",
+    obs_color: str = "white",
+    obs_edge_color: str = "black",
+    obs_label: str = "Meters",
+    draw_colorbar: bool = True,
+    figsize: Tuple[float, float] = (10, 8),
+    ax=None,
+) -> Tuple:
+    """Plot a scalar field as coloured flowlines on actual network geometry.
+
+    Edge colours vary linearly from the upstream endpoint value to the
+    downstream endpoint value by discretising each link into short
+    sub-segments.
+    """
+    plt = _import_plt()
+    from matplotlib.collections import LineCollection
+
+    created_fig = ax is None
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    _draw_edges(
+        ax,
+        edges,
+        coords,
+        color=base_edge_color,
+        linewidth=base_edge_width,
+        alpha=base_edge_alpha,
+        zorder=1,
+    )
+
+    plot_idx = np.array([i for i in range(len(node_names)) if node_names[i] in coords], dtype=int)
+    plot_values = values[plot_idx]
+    finite_values = plot_values[np.isfinite(plot_values)]
+
+    if vmax is None and vmax_percentile is not None and finite_values.size:
+        positive = finite_values[finite_values > 0] if (finite_values > 0).any() else finite_values
+        vmax = float(np.percentile(positive, vmax_percentile))
+    if vmin is None:
+        vmin = 0.0
+    if vmax is None:
+        vmax = 1.0
+
+    coloured_segments, segment_values, grey_segments = _build_flowline_segment_data(
+        node_names,
+        coords,
+        edges,
+        values,
+        n_edge_subsegments=n_edge_subsegments,
+    )
+
+    if grey_segments:
+        grey_lc = LineCollection(
+            grey_segments,
+            colors=base_edge_color,
+            linewidths=linewidth,
+            alpha=0.7,
+            capstyle="round",
+            zorder=2,
+        )
+        ax.add_collection(grey_lc)
+
+    flow_lc = None
+    if coloured_segments:
+        flow_lc = LineCollection(
+            coloured_segments,
+            cmap=cmap,
+            linewidths=linewidth,
+            capstyle="round",
+            zorder=3,
+        )
+        flow_lc.set_array(segment_values)
+        flow_lc.set_clim(vmin, vmax)
+        ax.add_collection(flow_lc)
+
+    if show_nodes:
+        px = [coords[node_names[i]][0] for i in plot_idx]
+        py = [coords[node_names[i]][1] for i in plot_idx]
+        ax.scatter(px, py, s=node_size, c="white", edgecolor="none", alpha=0.55, zorder=4)
+
+    if obs_nodes is not None:
+        ox = [coords[node_names[ni]][0] for ni in obs_nodes if node_names[ni] in coords]
+        oy = [coords[node_names[ni]][1] for ni in obs_nodes if node_names[ni] in coords]
+        ax.scatter(
+            ox,
+            oy,
+            c=obs_color,
+            s=40,
+            marker=obs_marker,
+            edgecolor=obs_edge_color,
+            linewidth=0.6,
+            zorder=5,
+            label=obs_label,
+        )
+
+    if draw_colorbar and flow_lc is not None:
+        cb = plt.colorbar(flow_lc, ax=ax, label=units, shrink=0.7)
+        if clip_label and vmax is not None and segment_values.size and (segment_values > vmax).any():
+            cb.ax.set_title(f"clipped at\n{vmax:.2g}", fontsize=7)
+
+    ax.set_xlabel("Easting")
+    ax.set_ylabel("Northing")
+    ax.set_title(title)
+    ax.set_aspect("equal")
+    if obs_nodes is not None:
+        ax.legend(fontsize=8, loc="lower right")
+    if created_fig:
+        fig.tight_layout()
     return fig, ax
 
 

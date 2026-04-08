@@ -485,8 +485,97 @@ def network_kriging_precision(
 
 
 # ════════════════════════════════════════════════════════════════
-# §5  MASS-BALANCE OPERATOR & PHYSICS-INFORMED PRECISION
+# §5  MASS-BALANCE OPERATOR, PROJECTION & PHYSICS-INFORMED PRECISION
 # ════════════════════════════════════════════════════════════════
+
+def project_mass_balance(
+    x: np.ndarray,
+    H: sparse.spmatrix,
+    *,
+    sigma: Optional[np.ndarray] = None,
+) -> dict:
+    """Project a flow vector onto exact mass-balance feasibility.
+
+    Given the mass-balance operator *H* (one row per junction node,
+    encoding ``x_j − Σ w_i x_{parent_i} = 0``), compute the minimum-norm
+    correction that zeroes every residual:
+
+        x_c = x − Hᵀ (H Hᵀ)⁻¹ H x
+
+    This is the orthogonal projection onto ``ker(H)`` — the closest
+    (in Euclidean norm) feasible flow field.
+
+    Parameters
+    ----------
+    x : (N,) array
+        Estimated flows in original (e.g. MGD) space.
+    H : (M, N) sparse matrix
+        Mass-balance operator from :func:`build_mass_balance_operator`.
+    sigma : (N,) optional
+        Marginal standard deviations.  If provided, approximate
+        post-projection std devs are returned via ``σ_c,i ≈ ‖Pᵢ‖ σᵢ``.
+
+    Returns
+    -------
+    dict with keys:
+        ``x_proj``    – (N,) projected flow vector
+        ``correction``– (N,) additive correction  (x_proj − x)
+        ``residuals_before`` – (M,) H @ x
+        ``residuals_after``  – (M,) H @ x_proj  (≈ 0)
+        ``n_clamped`` – int, number of negative entries clamped to 0
+        ``sigma_proj``– (N,) or None, post-projection std devs
+    """
+    x = np.asarray(x, dtype=np.float64)
+    H = sparse.csc_matrix(H, dtype=np.float64)
+    m, n = H.shape
+
+    r = H @ x                          # (M,) residuals
+    HHt = (H @ H.T).toarray()          # (M, M) — small for tree networks
+    try:
+        from scipy.linalg import cho_factor, cho_solve
+        cfactor = cho_factor(HHt)
+        lam = cho_solve(cfactor, r)     # (M,) = (HHᵀ)⁻¹ r
+    except np.linalg.LinAlgError:
+        # Fall back to least-squares if HHᵀ is singular
+        lam, _, _, _ = np.linalg.lstsq(HHt, r, rcond=None)
+
+    correction = -(H.T @ lam)          # (N,)  Hᵀ (HHᵀ)⁻¹ H x
+    x_proj = x + correction
+
+    # Clamp negatives
+    neg_mask = x_proj < 0
+    n_clamped = int(neg_mask.sum())
+    x_proj[neg_mask] = 0.0
+
+    # Approximate post-projection std dev
+    sigma_proj = None
+    if sigma is not None:
+        sigma = np.asarray(sigma, dtype=np.float64)
+        # P = I - Hᵀ (HHᵀ)⁻¹ H   →   Pᵢ row norms
+        # For each node i, σ_c,i ≈ ‖Pᵢ‖₂ · σᵢ
+        # P = I − Hᵀ Λ H  where Λ = (HHᵀ)⁻¹
+        # Build P row-by-row would be O(M·N); cheaper: ‖Pᵢ‖² = 1 − hᵢᵀ Λ hᵢ
+        # where hᵢ = H[:,i].  Since P is a projector, ‖Pᵢ‖² ∈ [0,1].
+        try:
+            diag_P2 = np.ones(n)
+            for i in range(n):
+                hi = H[:, i].toarray().ravel()
+                if np.any(hi != 0):
+                    Lhi = cho_solve(cfactor, hi)
+                    diag_P2[i] = max(1.0 - hi @ Lhi, 0.0)
+            sigma_proj = np.sqrt(diag_P2) * sigma
+        except Exception:
+            sigma_proj = sigma.copy()
+
+    return {
+        "x_proj": x_proj,
+        "correction": correction,
+        "residuals_before": r,
+        "residuals_after": H @ x_proj,
+        "n_clamped": n_clamped,
+        "sigma_proj": sigma_proj,
+    }
+
 
 def build_mass_balance_operator(
     n_nodes: int,

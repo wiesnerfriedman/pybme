@@ -105,10 +105,24 @@ from .network import (
     network_kriging_precision,
 )
 
+# Hodge Laplacian operators (time-varying network covariance)
+from .hodge import (
+    build_oriented_incidence,
+    build_hodge_laplacian_0,
+    build_hodge_laplacian_1,
+    hodge_decomposition,
+    HodgeNetworkCovariance,
+    HodgeNetworkCovarianceST,
+    SpectralHodgeNetworkCovariance,
+    SpectralHodgeNetworkCovarianceST,
+    EdgeCovariance,
+)
+
 # Network-domain plotting
 from .network_plots import (
     plot_network_observations,
     plot_network_field,
+    plot_network_flowlines,
     plot_network_correlation,
     plot_operator,
 )
@@ -166,9 +180,16 @@ __all__ = [
     "adjacency_from_edges",
     "network_kriging_precision",
     "bme_predict_network", "bme_predict_network_st",
+    # Hodge Laplacian operators
+    "build_oriented_incidence",
+    "build_hodge_laplacian_0", "build_hodge_laplacian_1",
+    "hodge_decomposition",
+    "HodgeNetworkCovariance", "HodgeNetworkCovarianceST",
+    "SpectralHodgeNetworkCovariance", "SpectralHodgeNetworkCovarianceST",
+    "EdgeCovariance",
     # Network-domain plotting
     "plot_network_observations", "plot_network_field",
-    "plot_network_correlation", "plot_operator",
+    "plot_network_flowlines", "plot_network_correlation", "plot_operator",
     # SWMM utilities
     "SwmmNetwork", "ObservationTable",
     "parse_swmm_inp", "build_edge_array",
