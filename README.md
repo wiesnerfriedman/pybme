@@ -1,3 +1,7 @@
+<p align="center">
+    <img src="docs/pybmelogo-cropped.png" alt="PyBME logo" width="760">
+</p>
+
 # PyBME, Bayesian Maximum Entropy Geostatistical Library
 
 **Author:** Corinne Wiesner-Friedman
